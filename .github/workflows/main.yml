@@ -104,13 +104,21 @@ jobs:
             powershell openjdk* mongodb* moby* 2>/dev/null || true
           # alpine-base 构建依赖：用 alpine-chroot-install 或 apk-tools-static
           sudo -E apt-get -y install \
-            apk-tools \
             parted e2fsprogs dosfstools btrfs-progs \
             u-boot-tools uuid-runtime openssl pigz \
             git curl wget xz-utils lz4 zstd pv jq rsync qemu-user-static
           sudo -E apt-get -y autoremove --purge
           sudo -E apt-get clean
           sudo -E timedatectl set-timezone "${TZ}"
+          wget https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/apk-tools-static-2.14.6-r3.apk
+
+          # 3. 提取里面的 sbin/apk.static 文件到系统的 /usr/bin/ 目录下
+          tar -xf apk-tools-static-2.14.6-r3.apk --strip-components=1 sbin/apk.static
+          sudo mv apk.static /usr/bin/apk.static
+          sudo chmod +x /usr/bin/apk.static
+
+          # 4. 清理下载的临时文件
+          rm -f apk-tools-static-2.14.6-r3.apk
 
           # 写入运行时变量
           ALPINE_VER="${{ inputs.alpine_version || '3.21' }}"
