@@ -1,12 +1,12 @@
 #!/sbin/openrc-run
 # Alpine Linux OpenRC init script for alpine-zram-config
-# Replaces: debian-zram-config.service / ubuntu-zram-config.service
 
 description="Alpine Linux ZRAM configuration"
 
 depend() {
+    # boot runlevel：在 swap 激活前配置 zram 设备
     need modules
-    before swap
+    before swap localmount
 }
 
 start() {

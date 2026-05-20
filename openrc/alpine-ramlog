@@ -1,12 +1,12 @@
 #!/sbin/openrc-run
 # Alpine Linux OpenRC init script for alpine-ramlog
-# Replaces: debian-ramlog.service / ubuntu-ramlog.service
 
 description="Alpine Linux RAM-based logging"
 
 depend() {
+    # boot runlevel：在任何写日志的服务启动前把 /var/log 挂到 tmpfs
     need localmount
-    before logger syslog
+    before logger syslog sshd
 }
 
 start() {

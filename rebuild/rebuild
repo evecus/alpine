@@ -1082,8 +1082,9 @@ refactor_rootfs() {
         sed -i '/if.*ipv6s.*||.*wan6/,/fi/s/^/#/' ${ip_info_file}
     }
 
-    # Explicitly disable resizing for Amlogic device [ /usr/lib/armbian/armbian-resize-filesystem ], use armbian-tf settings
-    echo "yes" >root/.no_rootfs_resize
+    # NOTE: .no_rootfs_resize intentionally NOT created for Alpine.
+    # Alpine uses alpine-resize-filesystem (OpenRC, boot runlevel) instead.
+    rm -f root/.no_rootfs_resize 2>/dev/null || true
 
     # Reduce network latency [ A start job is running for raise network interfaces (5 mins 1 sec) ]
     network_service="usr/lib/systemd/system/networking.service"

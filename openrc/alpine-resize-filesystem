@@ -1,17 +1,18 @@
 #!/sbin/openrc-run
 # Alpine Linux OpenRC init script for alpine-resize-filesystem
-# Replaces: debian-resize-filesystem.service / ubuntu-resize-filesystem.service
 
 description="Alpine Linux filesystem resize on first boot"
 
 depend() {
     need localmount
-    after alpine-zram-config
-    before net
+    after modules
+    before networking
 }
 
 start() {
     ebegin "Resizing Alpine root filesystem"
+    # 忽略 rebuild 可能残留的 .no_rootfs_resize 标志（该文件针对 Armbian/systemd，Alpine 不适用）
+    rm -f /root/.no_rootfs_resize 2>/dev/null || true
     /usr/lib/alpine/alpine-resize-filesystem start
     eend $?
 }
