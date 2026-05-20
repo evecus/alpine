@@ -1,0 +1,16 @@
+#!/bin/sh
+# 通用环境变量定义 - 适配 Panther-X2 (RK3566) - Alpine Linux 版本
+
+# 1. 定义日志路径
+Log="/var/log/alpine-hardware-monitor.log"
+
+# 2. 定义硬件标识
+BOARD="panther-x2"
+BOARDFAMILY="rockchip-rk3566"
+BOARD_NAME="Panther X2"
+
+# 3. 基础目录确保存在
+[ ! -f "$Log" ] && touch "$Log" && chmod 644 "$Log"
+
+# 4. 导出变量供全局使用
+export Log BOARD BOARDFAMILY BOARD_NAME

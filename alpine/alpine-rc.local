@@ -1,0 +1,11 @@
+#!/bin/sh -e
+# /etc/rc.local
+# Executed at the end of each multi-user runlevel (OpenRC: default).
+# Make sure that the script will exit 0 on success or any other value on error.
+
+# Custom startup service
+if [ -x /etc/custom_service/start_service.sh ]; then
+    /etc/custom_service/start_service.sh &
+fi
+
+exit 0

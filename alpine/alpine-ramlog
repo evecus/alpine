@@ -1,0 +1,131 @@
+#!/bin/sh
+#
+# Copyright (c) Authors: https://www.armbian.com/authors
+# Adapted for Alpine Linux
+#
+# This file is licensed under the terms of the GNU General Public
+# License version 2. This program is licensed "as is" without any
+# warranty of any kind, whether express or implied.
+
+SIZE=50M
+USE_RSYNC=true
+ENABLED=false
+HDD_LOG=/var/log.hdd
+
+[ -f /etc/default/alpine-ramlog ] && . /etc/default/alpine-ramlog
+
+[ "$ENABLED" != true ] && exit 0
+
+# Never touch anything below here. Only edit /etc/default/alpine-ramlog
+
+RAM_LOG=/var/log
+LOG2RAM_LOG="${HDD_LOG}/alpine-ramlog.log"
+LOG_OUTPUT="tee -a $LOG2RAM_LOG"
+
+isSafe() {
+    [ -d $HDD_LOG ] || (echo "ERROR: $HDD_LOG doesn't exist! Can't sync." >&2; exit 1)
+}
+
+RecreateLogs() {
+    # 重建常见服务日志目录（Alpine 用 apk info 检查包是否安装）
+    apk info -e apache2 >/dev/null 2>&1 && [ ! -d /var/log/apache2 ] && mkdir -p /var/log/apache2
+    apk info -e nginx >/dev/null 2>&1 && [ ! -d /var/log/nginx ] && \
+        (mkdir -p /var/log/nginx; touch /var/log/nginx/access.log; touch /var/log/nginx/error.log)
+    apk info -e lighttpd >/dev/null 2>&1 && [ ! -d /var/log/lighttpd ] && \
+        (mkdir -p /var/log/lighttpd; touch /var/log/lighttpd/access.log; touch /var/log/lighttpd/error.log)
+    apk info -e samba >/dev/null 2>&1 && [ ! -d /var/log/samba ] && mkdir -p /var/log/samba
+    return 0
+}
+
+syncToDisk() {
+    isSafe
+
+    echo "\n\n$(date): Syncing logs to storage\n" | $LOG_OUTPUT
+
+    if [ "$USE_RSYNC" = true ]; then
+        rsync -aXWv \
+            --exclude "lost+found" --exclude alpine-ramlog.log \
+            --exclude 'journal*' --one-file-system \
+            --links \
+            ${XTRA_RSYNC_TO:+"${XTRA_RSYNC_TO}"} \
+            $RAM_LOG/ $HDD_LOG/ 2>&1 | $LOG_OUTPUT
+    else
+        cp -rfup $RAM_LOG -T $HDD_LOG 2>&1 | $LOG_OUTPUT
+    fi
+    sync /
+}
+
+syncFromDisk() {
+    isSafe
+
+    echo "\n\n$(date): Loading logs from storage\n" | $LOG_OUTPUT
+
+    if [ "$USE_RSYNC" = true ]; then
+        rsync -aXWv --delete \
+            --exclude "lost+found" --exclude alpine-ramlog.log \
+            --exclude '*.gz' --exclude '*.xz' --exclude='*.[0-9]' \
+            --links \
+            --exclude 'journal*' --one-file-system \
+            ${XTRA_RSYNC_FROM:+"${XTRA_RSYNC_FROM}"} \
+            $HDD_LOG/ $RAM_LOG/ 2>&1 | $LOG_OUTPUT
+    else
+        find $HDD_LOG/* -maxdepth 1 -type f \
+            ! -name '*.[0-9]' ! -name '*.xz*' ! -name '*.gz' ! -name 'journal*' \
+            | xargs cp -ut $RAM_LOG/
+    fi
+    sync /
+}
+
+case "$1" in
+    start)
+        [ -d $HDD_LOG ] || mkdir -p $HDD_LOG
+        if [ "$HDD_LOG" = "/var/log.hdd" ]; then
+            mount --bind $RAM_LOG $HDD_LOG
+            mount --make-private $HDD_LOG
+        fi
+
+        # 检查 zram 设备是否可用
+        LOG_TYPE="tmpfs"
+        for rd in /dev/zram*; do
+            if e2label $rd 2>/dev/null | grep -q "log2ram"; then
+                LOG_TYPE="zram"
+                break
+            fi
+        done
+        case $LOG_TYPE in
+            zram)
+                echo "Mounting $rd as $RAM_LOG " | $LOG_OUTPUT
+                mount -o discard,nosuid,noexec,nodev $rd $RAM_LOG 2>&1 | $LOG_OUTPUT
+                ;;
+            tmpfs)
+                echo "Setting up $RAM_LOG as tmpfs " | $LOG_OUTPUT
+                mount -t tmpfs -o nosuid,noexec,nodev,mode=0755,size=$SIZE alpine-ramlog $RAM_LOG 2>&1 | $LOG_OUTPUT
+                ;;
+        esac
+
+        syncFromDisk
+        RecreateLogs
+        ;;
+    stop)
+        syncToDisk
+        umount -l $RAM_LOG
+        if [ "$HDD_LOG" = "/var/log.hdd" ]; then
+            umount -l $HDD_LOG
+        fi
+        ;;
+    write)
+        syncToDisk
+        ;;
+    postrotate)
+        cd $HDD_LOG
+        find . -type f -print | grep -Ev "(\.gz|\.xz|\.[0-9]|alpine-ramlog)|\.journal" | while IFS= read -r file; do
+            dest="/var/log/$file"
+            cat $file > $dest
+            touch -r $file $dest
+        done
+        ;;
+    *)
+        echo "Usage: ${0##*/} {start|stop|write}" >&2
+        exit 1
+        ;;
+esac

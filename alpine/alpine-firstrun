@@ -1,0 +1,36 @@
+#!/bin/sh
+# Copyright (c) Authors: https://www.armbian.com/authors
+# Adapted for Alpine Linux / panther-x2 (RK3566)
+
+. /etc/alpine-release
+. /usr/lib/alpine/alpine-common
+
+case "$1" in
+    start)
+        # SSH host keys 重新生成（Alpine 使用 openssh）
+        if [ -d /etc/ssh ]; then
+            entropy_before=$(cat /proc/sys/kernel/random/entropy_avail)
+            rm -f /etc/ssh/ssh_host_*
+            ssh-keygen -A >/dev/null 2>&1 || true
+            rc-service sshd restart 2>/dev/null || true
+            entropy_after=$(cat /proc/sys/kernel/random/entropy_avail)
+            echo "### [firstrun] SSH keys regenerated (entropy: ${entropy_before} -> ${entropy_after})" >> "${Log}"
+        fi
+
+        # 写入安装 UUID
+        if ! grep -q "^INSTALL_UUID=" /etc/alpine-release 2>/dev/null; then
+            UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+            [ -n "${UUID}" ] && echo "INSTALL_UUID=\"${UUID}\"" >> /etc/alpine-release
+            echo "### [firstrun] UUID=${UUID}" >> "${Log}"
+        fi
+
+        # 禁用自身（Alpine OpenRC: 从 default runlevel 移除）
+        rc-update del alpine-firstrun default 2>/dev/null || true
+        echo "### [firstrun] done" >> "${Log}"
+        exit 0
+        ;;
+    *)
+        echo "Usage: $0 start"
+        exit 0
+        ;;
+esac

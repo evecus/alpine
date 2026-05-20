@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+# Alpine Linux OpenRC init script for alpine-hardware-optimize
+# Replaces: debian-hardware-optimize.service / ubuntu-hardware-optimize.service
+
+description="Alpine Linux hardware optimization"
+
+depend() {
+    after modules
+    before net
+}
+
+start() {
+    ebegin "Applying Alpine hardware optimizations"
+    /usr/lib/alpine/alpine-hardware-optimization start
+    eend $?
+}

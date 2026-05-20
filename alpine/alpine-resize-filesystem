@@ -1,0 +1,239 @@
+#!/bin/sh
+#
+# Copyright (c) Authors: https://www.armbian.com/authors
+# Adapted for Alpine Linux
+#
+# This file is licensed under the terms of the GNU General Public
+# License version 2. This program is licensed "as is" without any
+# warranty of any kind, whether express or implied.
+
+. /etc/alpine-release
+. /usr/lib/alpine/alpine-common
+
+do_expand_partition() {
+    local partdev=$1
+    echo "\n### [resize2fs] Trying to resize partition $partdev:\n"
+
+    local parttype=$(lsblk -n -d -o TYPE $partdev)
+    if [ "$parttype" != "part" ]; then
+        echo "\n$partdev isn't a partition: $parttype" >&2
+        return 1
+    fi
+
+    local diskdevname=$(lsblk -n -d -o PKNAME $partdev)
+    [ -z $diskdevname ] && diskdevname=$(echo $partdev | sed -e "s/^\/dev\///" | sed "s/p.*//")
+    local diskdev="/dev/$diskdevname"
+    echo "diskdevname: $diskdevname"
+    echo "diskdev: $diskdev"
+
+    local partindex=$(echo $partdev | sed "s|^$diskdev||" | sed 's/^p//')
+    if [ -n "$(echo "$partindex" | tr -d '[:digit:]')" ]; then
+        echo "\nFail to detect partindex: $partindex" >&2
+        return 1
+    fi
+    echo "partindex: $partindex"
+
+    local partstart=$(parted $diskdev unit s print -sm | awk -F':' "NR>=3{if(\$1 == $partindex){print \$2}}" | sed 's/s//')
+    local partend=$(parted $diskdev unit s print -sm | awk -F':' "NR>=3{if(\$1 == $partindex){print \$3}}" | sed 's/s//')
+    if [ -z "$partstart" ] || [ -z "$partend" ]; then
+        echo "\nFail to find the target partition" >&2
+        return 1
+    fi
+    echo "partstart: ${partstart}s"
+    echo "partend: ${partend}s"
+
+    local list=$(parted $diskdev unit s print -sm | awk -F':' "NR>=3{if(\$2 - $partstart > 0){print \$1}}")
+    if [ -n "$list" ]; then
+        echo "\nThe target partition isn't the last partition in logical layout" >&2
+        return 1
+    fi
+
+    local capacity=$(parted $diskdev unit s print -sm | awk -F':' 'NR==2{print $2}' | sed 's/s//')
+    local sectorsize=$(parted $diskdev unit s print -sm | awk -F':' 'NR==2{print $4}')
+    echo "capacity: ${capacity}s"
+    echo "sectorsize: ${sectorsize}B"
+
+    if [ -f /root/.rootfs_resize ]; then
+        read RESIZE_VALUE < /root/.rootfs_resize
+        echo "Resize rule $RESIZE_VALUE defined for root partition"
+        case $RESIZE_VALUE in
+            *%)
+                local percentage=$(echo $RESIZE_VALUE | tr -c -d '[:digit:]')
+                local lastsector=$((capacity * percentage / 100))
+                ;;
+            *s)
+                local lastsector=$(echo $RESIZE_VALUE | tr -c -d '[:digit:]')
+                ;;
+            *B)
+                local byte=$(echo $RESIZE_VALUE | tr -c -d '[:digit:]')
+                local lastsector=$((byte / sectorsize))
+                ;;
+            *)
+                echo "\nUnknown rule: $RESIZE_VALUE" >&2
+                return 1
+                ;;
+        esac
+
+        if [ $(( sectorsize * (capacity - lastsector) )) -ge $((1 * 1024 * 1024 * 1024)) ]; then
+            local newpartition=$(( capacity * 99 / 100 ))
+        fi
+    else
+        if [ $((sectorsize * capacity)) -lt $((4 * 1024 * 1024 * 1024)) ]; then
+            local lastsector=$((capacity * 95 / 100))
+            echo "4GiB or smaller media - leaving 5% spare area"
+        elif [ $((sectorsize * capacity)) -lt $((8 * 1024 * 1024 * 1024)) ]; then
+            local lastsector=$((capacity * 98 / 100))
+            echo "8GiB or smaller media - leaving 2% spare area"
+        else
+            local lastsector=$((capacity * 99 / 100))
+            echo "Leaving 1% spare area"
+        fi
+    fi
+
+    local align=$((16 * 1024 * 1024 / sectorsize))
+    lastsector=$(( lastsector - (lastsector % align) - 1 ))
+    [ -n "$newpartition" ] && newpartition=$(( newpartition - (newpartition % align) ))
+
+    if [ $lastsector -lt $partend ]; then
+        echo "\n${partend} is larger than ${lastsector}s, shrinking not supported." >&2
+        return 1
+    elif [ $lastsector -eq $partend ]; then
+        echo "\nSame size. Skip" >&2
+        return 0
+    fi
+    [ -n "$newpartition" ] && [ $newpartition -le $((lastsector + 1)) ] && unset newpartition
+
+    echo "\nOld partition table:\n"
+    cat /proc/partitions
+
+    echo "\nExecuting fdisk:"
+    local partnum=$(parted $diskdev unit s print -sm | awk 'END{print NR-2}')
+    local fdisk_version=$(fdisk --version | awk '{print $NF}' | grep -oE "^[[:digit:]]\.[[:digit:]]+")
+
+    if [ $partnum -eq 1 ] && awk "BEGIN{exit ! ($fdisk_version >= 2.27 )}"; then
+        {
+            echo d
+            echo n; echo p; echo $partindex; echo $partstart; echo $lastsector
+            echo w
+        } | fdisk $diskdev
+    else
+        {
+            echo d; echo $partindex
+            echo n; echo p; echo $partindex; echo $partstart; echo $lastsector
+            echo w
+        } | fdisk $diskdev
+    fi
+    if [ -n "$newpartition" ]; then
+        {
+            echo n; echo p; echo; echo $((lastsector + 1)); echo $newpartition
+            echo w
+        } | fdisk $diskdev
+    fi
+
+    echo "\nExecuting partprobe:"
+    KERNELID=$(uname -r | awk -F'.' '{print ($1 * 100) + $2}')
+    if ! partprobe $rootdev && [ ${KERNELID} -le 507 ]; then
+        echo "\n### [resize2fs] Automated reboot needed to finish the resize procedure"
+        touch /var/run/resize2fs-reboot
+    fi
+
+    local partsize=$(lsblk -n -d -b -o SIZE $partdev)
+    local actualsize=$((sectorsize * (lastsector - partstart + 1)))
+    if [ $actualsize -ne $partsize ]; then
+        echo "\n### [resize2fs] Automated reboot needed to finish the resize procedure"
+        touch /var/run/resize2fs-reboot
+    fi
+
+    echo "\nNew partition table:\n"
+    cat /proc/partitions
+    return 0
+}
+
+do_expand_filesystem() {
+    local partdev=$1
+    local mountpoint=$2
+    local fstype=$(findmnt -n -o FSTYPE $mountpoint)
+
+    echo "\n### [resize2fs] Trying to resize $fstype filesystem on $partdev:\n"
+
+    case $fstype in
+        ext4)
+            echo "Running 'resize2fs $partdev' now..."
+            resize2fs $partdev
+            ;;
+        xfs)
+            echo "Running 'xfs_growfs $mountpoint' now..."
+            xfs_growfs $mountpoint
+            ;;
+        btrfs)
+            echo "Running 'btrfs filesystem resize max $mountpoint' now..."
+            btrfs filesystem resize max $mountpoint
+            ;;
+        *)
+            echo "Unsupported filesystem: $fstype"
+            echo "Trying to run 'resize2fs $partdev' now..."
+            resize2fs $partdev
+            return
+            ;;
+    esac
+
+    local devsize=$(lsblk -n -d -b -o SIZE $partdev)
+    local fssize=$(findmnt -n -b -o SIZE --target $mountpoint)
+    if [ $((100 * fssize / devsize)) -lt 90 ]; then
+        echo "\n### [resize2fs] Automated reboot needed to finish the resize procedure"
+        touch /var/run/resize2fs-reboot
+    fi
+}
+
+main() {
+    rm /var/run/resize2fs-reboot 2>/dev/null
+
+    # Logging header
+    CPU_ARCH=$(uname -m)
+    KERNELID=$(uname -r)
+    echo "$(date) | ${BOARD_NAME} | ${VERSION} | ${ARCH} | ${CPU_ARCH} | ${KERNELID}"
+
+    local rootdev=$(findmnt -n -o SOURCE / | sed 's~\[.*\]~~')
+
+    # check for crypt
+    if [ "$(lsblk -n -d -o TYPE $rootdev)" = "crypt" ]; then
+        local cryptname=$(lsblk -n -d -o NAME $rootdev)
+        local parent_uuid=$(awk "{if(\$1 == \"$cryptname\"){print \$2}}" /etc/crypttab | sed 's/UUID=//')
+        local parentdev=$(blkid -U $parent_uuid)
+
+        do_expand_partition "$parentdev"
+
+        # resize LUKS container
+        if [ -f /etc/rootfs.key ]; then
+            cryptsetup resize --key-file /etc/rootfs.key "$cryptname"
+        else
+            cryptsetup resize "$cryptname"
+        fi
+    else
+        if [ -f /usr/share/mkinitfs/features.d/growroot.files ] 2>/dev/null; then
+            echo "partition resize skipped: growroot detected."
+        else
+            do_expand_partition "$rootdev"
+        fi
+    fi
+
+    do_expand_filesystem "$rootdev" "/"
+
+    # disable itself (Alpine OpenRC)
+    if [ ! -f /var/run/resize2fs-reboot ]; then
+        rc-update del alpine-resize-filesystem default 2>/dev/null || true
+    fi
+    exit 0
+}
+
+case "$1" in
+    start)
+        touch ${Log}
+        chmod 644 ${Log}
+        main 2>&1 | tee -a ${Log}
+        ;;
+    *)
+        echo "Usage: $0 start"
+        exit 0
+        ;;
+esac

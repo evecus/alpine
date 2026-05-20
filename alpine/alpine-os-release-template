@@ -1,0 +1,7 @@
+NAME="Alpine Linux"
+ID=alpine
+VERSION_ID=__ALPINE_VERSION__
+VERSION_CODENAME=alpine__ALPINE_VERSION_NODOT__
+PRETTY_NAME="Alpine Linux __ALPINE_VERSION__"
+HOME_URL="https://alpinelinux.org/"
+BUG_REPORT_URL="https://gitlab.alpinelinux.org/alpine/aports/-/issues"

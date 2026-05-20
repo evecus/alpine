@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+# Alpine Linux OpenRC - run /etc/rc.local at default runlevel
+description="Run /etc/rc.local"
+
+depend() {
+    after net
+    after alpine-hardware-optimize
+}
+
+start() {
+    if [ -x /etc/rc.local ]; then
+        ebegin "Running rc.local"
+        /etc/rc.local
+        eend $?
+    fi
+}

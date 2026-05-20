@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+# Alpine Linux OpenRC init script for alpine-firstrun
+# Replaces: debian-firstrun.service / ubuntu-firstrun.service
+
+description="Alpine Linux first run tasks"
+
+depend() {
+    after sshd
+    before getty
+}
+
+start() {
+    ebegin "Running Alpine first-run initialization"
+    /usr/lib/alpine/alpine-firstrun start
+    eend $?
+}

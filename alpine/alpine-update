@@ -1,0 +1,433 @@
+#!/bin/sh
+#==================================================================================================
+#
+# This file is licensed under the terms of the GNU General Public
+# License version 2. This program is licensed "as is" without any
+# warranty of any kind, whether express or implied.
+#
+# Function: Alpine Linux kernel update
+# Based on: https://github.com/ophub/amlogic-s9xxx-armbian
+#
+# Command: alpine-update
+#
+#===================================== Set default parameters =====================================
+
+current_path="${PWD}"
+backup_path="/ddbr/backup"
+ophub_release_file="/etc/ophub-release"
+
+STEPS="[\033[95m STEPS \033[0m]"
+INFO="[\033[94m INFO \033[0m]"
+SUCCESS="[\033[92m SUCCESS \033[0m]"
+FINISH="[\033[93m FINISH \033[0m]"
+PROMPT="[\033[93m PROMPT \033[0m]"
+ERROR="[\033[91m ERROR \033[0m]"
+
+#==================================================================================================
+
+error_msg() {
+    echo -e "${ERROR} ${1}"
+    exit 1
+}
+
+# Check dependencies（Alpine 使用 apk）
+check_depends() {
+    echo -e "${STEPS} Start checking dependencies..."
+
+    is_missing="0"
+    # 映射：Alpine 包名与 Debian 等价包
+    necessary_packages="coreutils tar curl btrfs-progs e2fsprogs parted util-linux"
+    for package in ${necessary_packages}; do
+        apk info -e "${package}" >/dev/null 2>&1 || is_missing="1"
+    done
+
+    if [ "${is_missing}" -eq "1" ]; then
+        echo -e "${INFO} Start installing dependencies..."
+        apk update
+        apk add ${necessary_packages}
+        [ "${?}" -ne "0" ] && error_msg "Dependency installation failed, stop updating."
+    else
+        echo -e "${INFO} Dependency check completed."
+    fi
+
+    sync && echo ""
+}
+
+# Check network
+check_network() {
+    curl --connect-timeout 10 -s "github.com" >/dev/null 2>&1 && github_net="yes" || github_net="no"
+    if [ "${github_net}" = "yes" ]; then
+        echo -e "${INFO} You can access [ github.com ] normally."
+    else
+        error_msg "Your network cannot access [ github.com ], unable to query the kernel."
+    fi
+}
+
+# Check the disk running in the system
+check_disk() {
+    ROOT_PTNAME="$(df / | tail -n1 | awk '{print $1}' | awk -F '/' '{print $3}')"
+    [ -z "${ROOT_PTNAME}" ] && error_msg "Failed to query system partition information."
+
+    case "${ROOT_PTNAME}" in
+    mmcblk?p[0-9]*)
+        DISK_NAME=$(echo "${ROOT_PTNAME}" | sed -E 's/p[0-9]+$//')
+        ;;
+    [hsv]d[a-z][0-9]*)
+        DISK_NAME=$(echo "${ROOT_PTNAME}" | sed -E 's/[0-9]+$//')
+        ;;
+    nvme?n?p[0-9]*)
+        DISK_NAME=$(echo "${ROOT_PTNAME}" | sed -E 's/p[0-9]+$//')
+        ;;
+    *)
+        error_msg "Unrecognized disk type ${ROOT_PTNAME}!"
+        ;;
+    esac
+}
+
+# Initialize all variables
+init_var() {
+    echo -e "${STEPS} Start initializing parameters..."
+
+    [ -f "${ophub_release_file}" ] || error_msg "Missing [ ${ophub_release_file} ] file."
+    # Adjust parameter name
+    sed -i "s|^KERNEL_BRANCH=|KERNEL_TAGS=|g" ${ophub_release_file}
+    # Get values
+    . "${ophub_release_file}"
+    PLATFORM="${PLATFORM}"
+    KERNEL_REPO="${KERNEL_REPO}"
+    KERNEL_TAGS="${KERNEL_TAGS}"
+    KERNEL_BACKUP="no"
+    [ -z "${PLATFORM}" ] && error_msg "[ PLATFORM ] is missing, stop updating the kernel."
+
+    # Parse options: -r <repo> -u <tags> -k <version> -b <yes/no>
+    # Alpine sh（busybox ash）使用手动解析替代 getopt
+    while [ $# -gt 0 ]; do
+        case "${1}" in
+        -r)
+            [ -n "${2}" ] && KERNEL_REPO="${2}" || error_msg "Invalid -r parameter [ ${2} ]!"
+            shift 2
+            ;;
+        -u)
+            [ -n "${2}" ] && kernel_usage="${2}" || error_msg "Invalid -u parameter [ ${2} ]!"
+            shift 2
+            ;;
+        -k)
+            [ -n "${2}" ] && inputs_kernel="${2}" || error_msg "Invalid -k parameter [ ${2} ]!"
+            shift 2
+            ;;
+        -b)
+            if [ -n "${2}" ]; then
+                [ "${2}" = "no" ] && KERNEL_BACKUP="no" || KERNEL_BACKUP="yes"
+            else
+                error_msg "Invalid -b parameter [ ${2} ]!"
+            fi
+            shift 2
+            ;;
+        -h)
+            help_info
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            [ -n "${1}" ] && error_msg "Invalid option [ ${1} ]!"
+            break
+            ;;
+        esac
+    done
+
+    # Query the current version
+    current_kernel_signature="$(uname -r)"
+    current_kernel="$(uname -r | grep -oE '^[1-9].[0-9]{1,3}.[0-9]+')"
+    [ -z "${current_kernel}" ] && error_msg "Failed to query the current kernel version."
+
+    # Adjust kernel repository url format
+    [ -z "${KERNEL_REPO}" ] && KERNEL_REPO="ophub/kernel"
+    echo "${KERNEL_REPO}" | grep -q '^https:' && \
+        KERNEL_REPO="$(echo ${KERNEL_REPO} | awk -F'/' '{print $4"/"$5}')"
+    kernel_api="https://github.com/${KERNEL_REPO}"
+
+    # Set kernel tags
+    [ -n "${kernel_usage}" ] && KERNEL_TAGS="${kernel_usage}"
+    KERNEL_TAGS="${KERNEL_TAGS#kernel_}"
+    echo "${KERNEL_TAGS}" | grep -qE "(stable|flippy|beta|rk3588|rk35xx|h6)" || KERNEL_TAGS="stable"
+
+    check_disk
+
+    echo -e "${INFO} Platform:            [ ${PLATFORM} ]"
+    echo -e "${INFO} Kernel repository:   [ ${KERNEL_REPO} ]"
+    echo -e "${INFO} Kernel tags:         [ ${KERNEL_TAGS} ]"
+    echo -e "${INFO} Specify kernel:      [ ${inputs_kernel} ]"
+    echo -e "${INFO} Backup kernel:       [ ${KERNEL_BACKUP} ]"
+    echo -e "${INFO} Running on disk:     [ /dev/${DISK_NAME} ]"
+
+    sync && echo ""
+}
+
+# Query the latest kernel version
+query_version() {
+    cd ${current_path}
+    echo -e "${STEPS} Start querying kernel version..."
+
+    kernel_path="$(mktemp -d)"
+
+    # Prefer local kernel files
+    try_tarfile=$(ls *.tar.gz -l 2>/dev/null | grep "^-" | wc -l)
+    try_boot=$(ls boot-*.tar.gz 2>/dev/null | head -n 1)
+    if [ "${try_tarfile}" -ge "3" ] && [ -n "${try_boot}" ]; then
+        kernel_kownload_required="no"
+        local_kernel_version="$(echo ${try_boot} | sed 's/boot-\(.*\)\.tar\.gz/\1/')"
+        echo -e "${INFO} Found local kernel: [ ${local_kernel_version} ]"
+        echo -e "${INFO} Current: [ ${current_kernel_signature} ], Local: [ ${local_kernel_version} ]."
+        if [ "${current_kernel_signature}" = "${local_kernel_version}" ]; then
+            echo -e "${FINISH} Same version, no update needed."
+            exit 0
+        fi
+        inputs_kernel="$(echo ${try_boot} | grep -oE '[1-9].[0-9]{1,3}.[0-9]+')"
+        echo -e "${INFO} Moving kernel files to: [ ${kernel_path} ]"
+        [ -f "sha256sums" ] && mv -f sha256sums -t ${kernel_path}
+        mv -f *.tar.gz -t ${kernel_path}
+        [ "${?}" -ne "0" ] && error_msg "Failed to move local kernel files to [ ${kernel_path} ]."
+    fi
+
+    # 处理 inputs_kernel 末尾点号
+    [ -n "${inputs_kernel}" ] && [ "${inputs_kernel%?}" != "${inputs_kernel}" ] && \
+        [ "$(echo ${inputs_kernel} | tail -c 2)" = "." ] && inputs_kernel="${inputs_kernel}y"
+    [ -n "${inputs_kernel}" ] && \
+        [ "$(echo ${inputs_kernel} | tr -cd '.' | wc -c)" -eq "1" ] && \
+        inputs_kernel="${inputs_kernel}.y"
+
+    if [ -z "${inputs_kernel}" ] || \
+        (echo "${inputs_kernel}" | grep -qE '^[0-9].*[a-z]$' && ! echo "${inputs_kernel}" | grep -q '-'); then
+
+        kernel_verpatch="$(echo ${current_kernel} | awk -F '.' '{print $1"."$2}')"
+        echo "${inputs_kernel}" | grep -qE '^[0-9].*[a-z]$' && \
+            kernel_verpatch="${inputs_kernel%.*}"
+
+        check_network
+
+        echo -e "${INFO} Querying latest kernel of [ ${kernel_verpatch} ] series in [ kernel_${KERNEL_TAGS} ]..."
+        latest_version="$(
+            curl -fsSL \
+                ${kernel_api}/releases/expanded_assets/kernel_${KERNEL_TAGS} |
+                grep -oE "${kernel_verpatch}\.[0-9]+\.tar\.gz" | sed 's/.tar.gz//' |
+                sort -t. -k3 -rn | head -n 1
+        )"
+        [ -n "${latest_version}" ] || error_msg "Failed to query kernel version from [ ${kernel_api} ]."
+        inputs_kernel="${latest_version}"
+
+        echo -e "${INFO} Current: [ ${current_kernel} ], Latest: [ ${inputs_kernel} ]."
+        if [ "${current_kernel}" = "${inputs_kernel}" ]; then
+            echo -e "${FINISH} Latest version already installed, no update needed."
+            exit 0
+        fi
+    fi
+
+    sync && echo ""
+}
+
+# Download the kernel
+download_kernel() {
+    cd ${current_path}
+    echo -e "${STEPS} Start downloading kernel package..."
+
+    kernel_down_from="https://github.com/${KERNEL_REPO}/releases/download/kernel_${KERNEL_TAGS}/${inputs_kernel}.tar.gz"
+    echo -e "${INFO} Download from: [ ${kernel_down_from} ]"
+    echo -e "${INFO} Download to:   [ ${kernel_path} ]"
+    curl -fsSL "${kernel_down_from}" -o "${kernel_path}/${inputs_kernel}.tar.gz"
+    [ "${?}" -ne "0" ] && error_msg "Failed to download kernel."
+    tar -mxzf "${kernel_path}/${inputs_kernel}.tar.gz" -C "${kernel_path}"
+    [ "${?}" -ne "0" ] && error_msg "Failed to extract kernel [ ${inputs_kernel} ]."
+    kernel_path="${kernel_path}/${inputs_kernel}"
+
+    sync && echo ""
+}
+
+# Check kernel files
+check_kernel() {
+    cd ${kernel_path}
+    echo -e "${STEPS} Start checking kernel package..."
+
+    kernel_boot="$(ls boot-${inputs_kernel}*.tar.gz 2>/dev/null | head -n 1)"
+    kernel_name="${kernel_boot:5:-7}"
+    echo -e "${INFO} Kernel name: [ ${kernel_name} ]"
+
+    if [ "${current_kernel_signature}" = "${kernel_name}" ]; then
+        echo -e "${FINISH} Same kernel already installed, no update needed."
+        exit 0
+    fi
+
+    KERNEL_VERSION="$(echo ${kernel_name} | grep -oE '^[1-9].[0-9]{1,3}.[0-9]+')"
+    [ -z "${KERNEL_VERSION}" ] && error_msg "Invalid kernel in [ ${kernel_path} ]"
+
+    # Check sha256sums
+    sha256sums_file="sha256sums"
+    sha256sums_check="1"
+    [ -s "${sha256sums_file}" ] && [ -n "$(cat ${sha256sums_file})" ] || sha256sums_check="0"
+    if [ "${sha256sums_check}" -eq "1" ]; then
+        echo -e "${INFO} Performing sha256sum verification..."
+        i="1"
+        for kernel_file in "boot" "dtb-${PLATFORM}" "modules" "header"; do
+            tmp_file="${kernel_file}-${kernel_name}.tar.gz"
+            if [ ! -s "${tmp_file}" ]; then
+                if [ "${kernel_file}" = "header" ]; then
+                    echo -e "${PROMPT} (${i}/4) [ ${tmp_file} ] missing, skip."
+                    i=$((i + 1)); continue
+                else
+                    error_msg "[ ${tmp_file} ] is missing."
+                fi
+            fi
+            tmp_sha256sum="$(sha256sum "${tmp_file}" | awk '{print $1}')"
+            tmp_checkcode="$(grep ${tmp_file} ${sha256sums_file} | awk '{print $1}')"
+            [ "${tmp_sha256sum}" = "${tmp_checkcode}" ] || error_msg "${tmp_file}: sha256sum verification failed."
+            echo -e "${INFO} (${i}/4) [ ${tmp_file} ] verified."
+            i=$((i + 1))
+        done
+    fi
+
+    sync && echo ""
+}
+
+# Backup current kernel
+backup_kernel() {
+    echo -e "${STEPS} Start backing up current kernel..."
+
+    [ -d "${backup_path}" ] || mkdir -p ${backup_path}
+    rm -rf ${backup_path}/${current_kernel}
+
+    # Keep latest 3 backups
+    backup_kernel_list=$(ls ${backup_path} -lt | grep "^d" | awk '{print $9}')
+    count=$(echo "$backup_kernel_list" | grep -c . 2>/dev/null || echo 0)
+    if [ "${count}" -ge "3" ]; then
+        echo "$backup_kernel_list" | tail -n +3 | while read d; do
+            rm -rf ${backup_path}/${d}
+        done
+    fi
+
+    mkdir -p ${backup_path}/${current_kernel}
+    kernel_tmp_path="$(mktemp -d)"
+    cd ${kernel_tmp_path}
+
+    # 1. boot files
+    rm -rf *
+    cp -rf /boot/*-${current_kernel_signature} -t . 2>/dev/null
+    [ "${?}" -ne "0" ] && error_msg "(1/3) Failed to copy /boot/*-${current_kernel_signature} files."
+    rm -rf dtb*
+    chmod +x *
+    tar -czf boot-${current_kernel_signature}.tar.gz *
+    mv -f *.tar.gz ${backup_path}/${current_kernel}
+    echo -e "${INFO} (1/3) Backed up [ boot-${current_kernel_signature}.tar.gz ]."
+
+    # 2. dtb files
+    rm -rf *
+    cp -rf /boot/dtb/${PLATFORM}/* -t . 2>/dev/null
+    [ "${?}" -ne "0" ] && error_msg "(2/3) Failed to copy /boot/dtb/${PLATFORM}/* files."
+    tar -czf dtb-${PLATFORM}-${current_kernel_signature}.tar.gz *
+    mv -f *.tar.gz ${backup_path}/${current_kernel}
+    echo -e "${INFO} (2/3) Backed up [ dtb-${PLATFORM}-${current_kernel_signature}.tar.gz ]."
+
+    # 3. modules
+    rm -rf *
+    cp -rf /usr/lib/modules/${current_kernel_signature} -t . 2>/dev/null
+    [ "${?}" -ne "0" ] && error_msg "(3/3) Failed to copy /usr/lib/modules/${current_kernel_signature}."
+    tar -czf modules-${current_kernel_signature}.tar.gz *
+    mv -f *.tar.gz ${backup_path}/${current_kernel}
+    echo -e "${INFO} (3/3) Backed up [ modules-${current_kernel_signature}.tar.gz ]."
+
+    # sha256sums
+    cd ${backup_path}/${current_kernel}
+    sha256sum * > sha256sums
+    echo -e "${INFO} Backup path: [ ${backup_path}/${current_kernel} ]."
+
+    sync && echo ""
+}
+
+# Update the kernel
+update_kernel() {
+    cd ${kernel_path}
+    echo -e "${STEPS} Start unpacking kernel..."
+
+    # Clean old kernel files
+    rm -f /boot/config-* /boot/initrd.img-* /boot/System.map-* /boot/uInitrd-* /boot/vmlinuz-*
+    rm -rf /boot/uInitrd /boot/Image /boot/zImage /boot/dtb-*
+
+    # 1. /boot files
+    tar -mxzf boot-${kernel_name}.tar.gz -C /boot
+    case "${PLATFORM}" in
+        amlogic)
+            (cd /boot && cp -f uInitrd-${kernel_name} uInitrd && cp -f vmlinuz-${kernel_name} zImage)
+            ;;
+        rockchip)
+            (cd /boot && ln -sf uInitrd-${kernel_name} uInitrd && ln -sf vmlinuz-${kernel_name} Image)
+            ;;
+        allwinner)
+            (cd /boot && cp -f uInitrd-${kernel_name} uInitrd && cp -f vmlinuz-${kernel_name} Image)
+            ;;
+    esac
+    [ "$(ls /boot/*${kernel_name}* -l 2>/dev/null | grep "^-" | wc -l)" -ge "4" ] || \
+        error_msg "/boot files missing after unpack."
+    echo -e "${INFO} (1/3) Unpacked [ boot-${kernel_name}.tar.gz ]."
+
+    # 2. /boot/dtb/${PLATFORM}/
+    [ -d "/boot/dtb/${PLATFORM}" ] || mkdir -p /boot/dtb/${PLATFORM}
+    tar -mxzf dtb-${PLATFORM}-${kernel_name}.tar.gz -C /boot/dtb/${PLATFORM}
+    [ "${PLATFORM}" = "rockchip" ] && ln -sf dtb /boot/dtb-${kernel_name}
+    [ "$(ls /boot/dtb/${PLATFORM} -l 2>/dev/null | grep "^-" | wc -l)" -ge "2" ] || \
+        error_msg "/boot/dtb/${PLATFORM} files missing."
+    echo -e "${INFO} (2/3) Unpacked [ dtb-${PLATFORM}-${kernel_name}.tar.gz ]."
+
+    # 3. /usr/lib/modules/
+    rm -rf /usr/lib/modules/*
+    tar -mxzf modules-${kernel_name}.tar.gz -C /usr/lib/modules
+    [ -d "/usr/lib/modules/${kernel_name}" ] || error_msg "/usr/lib/modules/${kernel_name} missing."
+    echo -e "${INFO} (3/3) Unpacked [ modules-${kernel_name}.tar.gz ]."
+
+    # Update kernel version in ophub-release
+    sed -i "s|^KERNEL_VERSION=.*|KERNEL_VERSION='${KERNEL_VERSION}'|g" ${ophub_release_file}
+
+    # Clean tmp files
+    rm -f *${kernel_name}*.tar.gz sha256sums
+
+    sync && echo ""
+}
+
+# Display help
+help_info() {
+    cat <<EOF
+  Usage: alpine-update [options]
+
+  Options:
+    -r <owner/repo>   Kernel download repository (default: ophub/kernel)
+    -u <tags>         Kernel tags: stable/flippy/beta/rk35xx (default: stable)
+    -k <version>      Kernel version, e.g. 6.1.y or 6.1.100 (default: latest)
+    -b <yes/no>       Backup current kernel before update (default: no)
+    -h                Show this help
+
+  Example:
+    alpine-update
+    alpine-update -k 6.1.y
+    alpine-update -k 6.6.y -u stable -b no
+EOF
+    exit 0
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+[ "$(id -u)" = "0" ] || error_msg "Please run as root: [ sudo alpine-update ]"
+
+[ "${1}" = "-h" ] && help_info
+
+echo -e "${STEPS} Welcome to the Alpine Linux kernel update tool."
+
+check_depends
+init_var "${@}"
+query_version
+[ "${kernel_kownload_required:=yes}" != "no" ] && download_kernel
+check_kernel
+[ "${KERNEL_BACKUP}" = "yes" ] && backup_kernel
+update_kernel
+
+sync && sleep 3
+echo -e "${SUCCESS} Kernel update successful. System is restarting..."
+reboot

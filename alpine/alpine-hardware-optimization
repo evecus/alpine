@@ -1,0 +1,92 @@
+#!/bin/sh
+# Copyright (c) Authors: https://www.armbian.com/authors
+# Adapted for Alpine Linux / panther-x2 (RK3566)
+
+. /etc/alpine-release
+. /usr/lib/alpine/alpine-common
+
+set_io_scheduler() {
+    KERNELID=$(uname -r | awk -F'.' '{print ($1 * 100) + $2}')
+    for i in $(lsblk -idn -o NAME | grep -v zram); do
+        read ROTATE < /sys/block/$i/queue/rotational
+        case ${ROTATE} in
+            1) [ $KERNELID -lt 420 ] && sched=cfq || sched=bfq ;;
+            0) [ $KERNELID -lt 420 ] && sched=noop || sched=none ;;
+            *) continue ;;
+        esac
+        echo $sched > /sys/block/$i/queue/scheduler
+        echo "### [hw-opt] I/O scheduler: $sched for $i" >> "${Log}"
+    done
+}
+
+prepare_board() {
+    # logrotate 路径修正（zram ramlog 场景）
+    # Alpine 使用 /etc/logrotate.d/（需安装 logrotate 包）
+    CheckDevice=$(for i in /var/log /var /; do findmnt -n -o SOURCE $i && break; done)
+    if [ "${CheckDevice}" != "${CheckDevice#*/dev/zram}" ] || [ "${CheckDevice}" = "alpine-ramlog" ]; then
+        for f in /etc/logrotate.d/*; do
+            [ -f "$f" ] && sed -i "s|/var/log/|/var/log.hdd/|g" "${f}"
+        done
+        [ -f /etc/logrotate.conf ] && sed -i "s|/var/log/|/var/log.hdd/|g" /etc/logrotate.conf
+    else
+        for f in /etc/logrotate.d/*; do
+            [ -f "$f" ] && sed -i "s|/var/log.hdd/|/var/log/|g" "${f}"
+        done
+        [ -f /etc/logrotate.conf ] && sed -i "s|/var/log.hdd/|/var/log/|g" /etc/logrotate.conf
+    fi
+
+    # cpufreq 权限修正
+    for f in /sys/devices/system/cpu/cpufreq/*/cpuinfo_cur_freq; do
+        [ -f "$f" ] && chmod +r "$f" 2>/dev/null || true
+    done
+    [ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq ] && \
+        chmod +r /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq 2>/dev/null || true
+
+    # CPU governor（从 /etc/default/cpufrequtils 读取）
+    if [ -r /etc/default/cpufrequtils ]; then
+        . /etc/default/cpufrequtils
+        for cluster in /sys/devices/system/cpu/cpufreq/policy*; do
+            [ -e "${cluster}" ] || break
+            grep -q "${GOVERNOR}" "${cluster}/scaling_available_governors" 2>/dev/null && \
+                [ -w "${cluster}/scaling_governor" ] && echo "${GOVERNOR}" > "${cluster}/scaling_governor"
+            [ -n "${MIN_SPEED}" ] && [ -w "${cluster}/scaling_min_freq" ] && echo "${MIN_SPEED}" > "${cluster}/scaling_min_freq"
+            [ -n "${MAX_SPEED}" ] && [ -w "${cluster}/scaling_max_freq" ] && echo "${MAX_SPEED}" > "${cluster}/scaling_max_freq"
+        done
+    fi
+
+    # rk3566 IRQ 分配（panther-x2）
+    # USB3(xhci) → cpu2, GPU → cpu1, Ethernet → cpu3
+    for i in $(awk -F':' '/xhci/{print $1}' /proc/interrupts | sed 's/ //g'); do
+        echo 4 > /proc/irq/$i/smp_affinity 2>/dev/null || true
+    done
+    for i in $(awk -F':' '/Mali|mali|gpu/{print $1}' /proc/interrupts | sed 's/ //g'); do
+        echo 2 > /proc/irq/$i/smp_affinity 2>/dev/null || true
+    done
+    # 等待网卡 IRQ 出现（最多5秒）
+    i=1
+    while [ $i -le 5 ]; do
+        grep -qE 'eth0|end0' /proc/interrupts && break
+        sleep 1
+        i=$((i + 1))
+    done
+    ETH_IFACE=$(ip -o link | awk -F': ' '/eth|end/{print $2; exit}' | sed 's/@.*//')
+    if [ -n "${ETH_IFACE}" ]; then
+        for i in $(awk -F':' "/${ETH_IFACE}/{print \$1}" /proc/interrupts | sed 's/ //g'); do
+            echo 8 > /proc/irq/$i/smp_affinity 2>/dev/null || true
+        done
+        echo 7 > /sys/class/net/${ETH_IFACE}/queues/rx-0/rps_cpus 2>/dev/null || true
+        echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+        echo 32768 > /sys/class/net/${ETH_IFACE}/queues/rx-0/rps_flow_cnt 2>/dev/null || true
+    fi
+
+    echo "### [hw-opt] board preparation done (${BOARD}/${BOARDFAMILY})" >> "${Log}"
+}
+
+case $1 in
+    *start*)
+        touch "${Log}"; chmod 644 "${Log}"
+        set_io_scheduler &
+        prepare_board &
+        wait
+        ;;
+esac

@@ -1,0 +1,16 @@
+# configuration values for the alpine-ram-logging service
+#
+# enable the alpine-ram-logging service?
+ENABLED=true
+#
+# size of the tmpfs mount
+SIZE=50M
+#
+# use rsync instead of cp -r
+USE_RSYNC=true
+
+XTRA_RSYNC_FROM=()
+
+# uncomment/change this if you want to move the long-term log storage
+# e.g. to use NVMe.
+#HDD_LOG=/mnt/nvme/log

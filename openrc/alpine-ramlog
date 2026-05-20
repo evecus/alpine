@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+# Alpine Linux OpenRC init script for alpine-ramlog
+# Replaces: debian-ramlog.service / ubuntu-ramlog.service
+
+description="Alpine Linux RAM-based logging"
+
+depend() {
+    need localmount
+    before logger syslog
+}
+
+start() {
+    ebegin "Starting Alpine RAM logging"
+    /usr/lib/alpine/alpine-ramlog start
+    eend $?
+}
+
+stop() {
+    ebegin "Stopping Alpine RAM logging (syncing to disk)"
+    /usr/lib/alpine/alpine-ramlog stop
+    eend $?
+}

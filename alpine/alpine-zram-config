@@ -1,0 +1,118 @@
+#!/bin/sh
+#
+# Copyright (c) Authors: https://www.armbian.com/authors
+# Adapted for Alpine Linux
+#
+# This file is licensed under the terms of the GNU General Public
+# License version 2. This program is licensed "as is" without any
+# warranty of any kind, whether express or implied.
+
+# Read in basic OS image information
+. /etc/alpine-release
+
+# Read mkfs version
+MKFS_VERSION=$(mkfs --version 2>&1 | grep -oP 'util-linux\s+\K[0-9]+(\.[0-9]+)*' | head -n1)
+# Fallback: Alpine 的 busybox mkfs 可能不支持上述格式
+[ -z "$MKFS_VERSION" ] && MKFS_VERSION=$(mkfs.ext4 -V 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+
+# and script configuration
+. /usr/lib/alpine/alpine-common
+
+ENABLED=false
+[ -f /etc/default/alpine-zram-config ] && . /etc/default/alpine-zram-config
+[ "$ENABLED" != "true" ] && exit 0
+
+# Exit if module not loaded
+if ! modinfo "zram" 2>/dev/null; then exit 0; fi
+
+activate_zram() {
+    uname -r | grep -q '^3\.' && zram_max_devs=${ZRAM_MAX_DEVICES:=4} || zram_max_devs=1
+    cpu_cores=$(grep -c '^processor' /proc/cpuinfo | sed 's/^0$/1/')
+    [ ${cpu_cores} -gt ${zram_max_devs} ] && zram_devices=${zram_max_devs} || zram_devices=${cpu_cores}
+    module_args=$(modinfo zram | awk -F" " '/num_devices/ {print $2}' | cut -f1 -d:)
+    [ -n "${module_args}" ] && modprobe zram ${module_args}=$((zram_devices + 1)) || return
+
+    swap_algo=${SWAP_ALGORITHM:=lzo}
+    zram_percent=${ZRAM_PERCENTAGE:=50}
+    mem_info=$(LC_ALL=C free | grep "^Mem")
+    mem_info=$(echo $mem_info | awk '{print $2}')
+    memory_total=$((mem_info * 1024))
+    mem_per_zram_device=$((memory_total * zram_percent / zram_devices / 100))
+
+    mem_limit_percent=${MEM_LIMIT_PERCENTAGE:=50}
+    mem_limit_per_zram_device=$((memory_total * mem_limit_percent / zram_devices / 100))
+}
+
+activate_zram_swap() {
+    [ -n "$SWAP" ] && [ "$SWAP" != "true" ] && return
+
+    [ -f /sys/module/zswap/parameters/enabled ] && echo 0 > /sys/module/zswap/parameters/enabled
+
+    i=1
+    while [ $i -le $zram_devices ]; do
+        swap_device=$(zramctl -f | sed 's/\/dev\///')
+        case "$swap_device" in
+            zram*) ;;
+            *) printf "\n### No more available zram devices (%s)\n" "${swap_device}" >> ${Log}; exit 1 ;;
+        esac
+        if [ -f /sys/block/${swap_device}/comp_algorithm ]; then
+            grep -q 'lzo-rle' /sys/block/${swap_device}/comp_algorithm && \
+                [ "X${swap_algo}" = "Xlzo" ] && swap_algo="lzo-rle"
+            echo ${swap_algo} > /sys/block/${swap_device}/comp_algorithm 2>/dev/null
+        fi
+        [ "X${ZRAM_BACKING_DEV}" != "X" ] && \
+            echo ${ZRAM_BACKING_DEV} > /sys/block/${swap_device}/backing_dev
+        echo -n ${ZRAM_MAX_DEVICES:=4} > /sys/block/${swap_device}/max_comp_streams
+        echo -n ${mem_per_zram_device} > /sys/block/${swap_device}/disksize
+        echo -n ${mem_limit_per_zram_device} > /sys/block/${swap_device}/mem_limit
+        mkswap /dev/${swap_device}
+        swapon -p 5 /dev/${swap_device}
+        i=$((i + 1))
+    done
+
+    echo 0 > /proc/sys/vm/page-cluster
+    printf "\n### Activated %s %s zram swap devices with %dMB each.\n" \
+        "${zram_devices}" "${swap_algo}" "$((mem_per_zram_device / 1048576))" >> ${Log}
+}
+
+activate_ramlog_partition() {
+    ENABLED=$(awk -F"=" '/^ENABLED/ {print $2}' /etc/default/alpine-ramlog)
+    [ "$ENABLED" != "true" ] && return
+    log_device=$(zramctl -f | sed 's/\/dev\///')
+    case "$log_device" in
+        zram*) ;;
+        *) printf "\n### No more available zram devices (%s)\n" "${log_device}" >> ${Log}; exit 1 ;;
+    esac
+
+    ramlogsize=$(awk -F"=" '/^SIZE/ {print $2}' /etc/default/alpine-ramlog)
+    disksize=$(echo "${ramlogsize:=50M}" | sed -e 's/M$/*1048576/' -e 's/K$/*1024/' | bc)
+
+    if [ "X${RAMLOG_ALGORITHM}" = "X" ]; then
+        for algo in lz4 lz4hc quicklz zlib brotli zstd; do
+            echo ${algo} > /sys/block/${log_device}/comp_algorithm 2>/dev/null
+        done
+    else
+        echo ${RAMLOG_ALGORITHM} > /sys/block/${log_device}/comp_algorithm 2>/dev/null
+    fi
+    echo -n ${disksize} > /sys/block/${log_device}/disksize
+
+    if [ $? -eq 1 ]; then
+        echo ${swap_algo} > /sys/block/${log_device}/comp_algorithm 2>/dev/null
+        echo -n ${disksize} > /sys/block/${log_device}/disksize
+    fi
+
+    # Alpine 使用 e2fsprogs，版本判断逻辑兼容
+    # util-linux 版本比较（Alpine musl 环境可能用 awk 替代 dpkg --compare-versions）
+    mkfs.ext4 -O ^has_journal -L log2ram /dev/${log_device}
+
+    algo=$(sed 's/.*\[\([^]]*\)\].*/\1/g' < /sys/block/${log_device}/comp_algorithm)
+    printf "### Activated Alpine ramlog partition with %s compression\n" "${algo}" >> ${Log}
+}
+
+case $1 in
+    *start*)
+        activate_zram
+        activate_zram_swap
+        activate_ramlog_partition
+        ;;
+esac
