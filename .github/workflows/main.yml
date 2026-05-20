@@ -229,7 +229,8 @@ jobs:
             lsof file procps \
             rsync \
             util-linux \
-            kmod
+            kmod \
+            dhcpcd
 
           # ── Step 3：额外包 ────────────────────────────────────────────
           if [[ -n "${EXTRA_PKGS}" ]]; then
@@ -388,7 +389,7 @@ jobs:
           done
 
           # default：正常用户态服务
-          for svc in sshd chrony local alpine-firstrun alpine-hardware-optimize; do
+          for svc in sshd chrony local alpine-firstrun alpine-hardware-optimize dhcpcd; do
             sudo ln -sf "/etc/init.d/${svc}" "${ROOTFS_DIR}/etc/runlevels/default/${svc}"
           done
 
@@ -506,7 +507,7 @@ jobs:
             -k ${KERNEL} \
             -a true \
             -t ${FSTYPE} \
-            -s 256/512 \
+            -s 256/1024 \
             -r ophub/kernel \
             -n ${BUILDER}
 
