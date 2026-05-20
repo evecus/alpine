@@ -104,7 +104,7 @@ jobs:
             powershell openjdk* mongodb* moby* 2>/dev/null || true
           # alpine-base 构建依赖：用 alpine-chroot-install 或 apk-tools-static
           sudo -E apt-get -y install \
-            apk-tools-static \
+            apk-tools \
             parted e2fsprogs dosfstools btrfs-progs \
             u-boot-tools uuid-runtime openssl pigz \
             git curl wget xz-utils lz4 zstd pv jq rsync qemu-user-static
