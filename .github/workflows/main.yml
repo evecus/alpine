@@ -1,0 +1,546 @@
+#==========================================================================
+# 用途：构建 panther-x2 (RK3566) Alpine Linux 固件
+#
+# 两种模式（自动判断）：
+#   A. 填写 rootfs_url → 直接用现有 rootfs 执行 rebuild（快，约 5 分钟）
+#   B. 不填 rootfs_url → 先构建 rootfs 再 rebuild，同时发布 rootfs + 固件
+#==========================================================================
+name: Build Alpine
+
+on:
+  workflow_dispatch:
+    inputs:
+      rootfs_url:
+        description: "已有 rootfs tar.gz 链接（留空则自动构建 rootfs）"
+        required: false
+        default: ""
+
+      alpine_version:
+        description: "Alpine Linux 版本"
+        required: false
+        default: "3.21"
+        type: choice
+        options:
+          - "3.21"
+          - "3.20"
+          - "edge"
+
+      armbian_kernel:
+        description: "内核版本"
+        required: false
+        default: "6.12.y"
+        type: choice
+        options:
+          - 6.12.y
+          - 6.1.y
+
+      armbian_fstype:
+        description: "rootfs 文件系统类型"
+        required: false
+        default: "ext4"
+        type: choice
+        options:
+          - ext4
+          - btrfs
+
+      root_password:
+        description: "root 密码（仅自建 rootfs 时生效）"
+        required: false
+        default: "1234"
+
+      hostname:
+        description: "主机名（仅自建 rootfs 时生效）"
+        required: false
+        default: "alpine"
+
+      timezone:
+        description: "时区（仅自建 rootfs 时生效）"
+        required: false
+        default: "Asia/Shanghai"
+        type: choice
+        options:
+          - Asia/Shanghai
+          - UTC
+
+      extra_packages:
+        description: "额外安装的包，空格分隔（仅自建 rootfs 时生效）"
+        required: false
+        default: ""
+
+      builder_name:
+        description: "构建者签名"
+        required: false
+        default: "mybuilder"
+
+env:
+  TZ: UTC
+  ALPINE_MIRROR: "https://dl-cdn.alpinelinux.org/alpine"
+  ROOTFS_DIR: /builder/alpine-rootfs
+  BOARD: panther-x2
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 1. 初始化环境 ──────────────────────────────────────────────────
+      - name: Initialize environment
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
+
+          sudo -E apt-get -y update
+          sudo -E apt-get -y purge \
+            azure-cli ghc* zulu* llvm* firefox google* dotnet* \
+            powershell openjdk* mongodb* moby* 2>/dev/null || true
+          # alpine-base 构建依赖：用 alpine-chroot-install 或 apk-tools-static
+          sudo -E apt-get -y install \
+            apk-tools-static \
+            parted e2fsprogs dosfstools btrfs-progs \
+            u-boot-tools uuid-runtime openssl pigz \
+            git curl wget xz-utils lz4 zstd pv jq rsync qemu-user-static
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          sudo -E timedatectl set-timezone "${TZ}"
+
+          # 写入运行时变量
+          ALPINE_VER="${{ inputs.alpine_version || '3.21' }}"
+          # edge 分支直接用 edge，否则拼 v 前缀
+          if [[ "${ALPINE_VER}" == "edge" ]]; then
+            ALPINE_BRANCH="edge"
+          else
+            ALPINE_BRANCH="v${ALPINE_VER}"
+          fi
+          echo "ALPINE_VERSION=${ALPINE_VER}"     >> "${GITHUB_ENV}"
+          echo "ALPINE_BRANCH=${ALPINE_BRANCH}"   >> "${GITHUB_ENV}"
+          echo "ROOT_PASSWORD=${{ inputs.root_password || '1234' }}"         >> "${GITHUB_ENV}"
+          echo "HOSTNAME_VAL=${{ inputs.hostname || 'alpine' }}"             >> "${GITHUB_ENV}"
+          echo "TZ_VAL=${{ inputs.timezone || 'Asia/Shanghai' }}"            >> "${GITHUB_ENV}"
+          echo "EXTRA_PKGS=${{ inputs.extra_packages || '' }}"               >> "${GITHUB_ENV}"
+
+          # 判断模式
+          ROOTFS_URL="${{ inputs.rootfs_url }}"
+          if [[ -n "${ROOTFS_URL}" ]]; then
+            echo "BUILD_ROOTFS=false" >> "${GITHUB_ENV}"
+            echo "ROOTFS_URL=${ROOTFS_URL}" >> "${GITHUB_ENV}"
+            echo "▶ 模式：使用已有 rootfs → ${ROOTFS_URL}"
+          else
+            echo "BUILD_ROOTFS=true"  >> "${GITHUB_ENV}"
+            echo "ROOTFS_URL="        >> "${GITHUB_ENV}"
+            echo "▶ 模式：自建 rootfs"
+          fi
+
+          echo "status=success" >> "${GITHUB_OUTPUT}"
+
+      # ── 2. 合并磁盘空间 ───────────────────────────────────────────────
+      - name: Create build disk
+        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
+          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
+          sudo truncate -s "${mnt_size}G"  /mnt/mnt.img
+          sudo truncate -s "${root_size}G" /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6 /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs -f -i sparse=0 /dev/github/runner
+          sudo mkdir -p /builder
+          sudo mount /dev/github/runner /builder
+          sudo chown -R runner:runner /builder
+          echo "可用空间: $(df -h /builder | tail -1 | awk '{print $4}')"
+
+      # ── 3A. 自建 Alpine rootfs（rootfs_url 为空时执行）───────────────
+      - name: Build Alpine rootfs
+        id: build_rootfs
+        if: ${{ steps.init.outputs.status == 'success' && env.BUILD_ROOTFS == 'true' && !cancelled() }}
+        run: |
+          set -euo pipefail
+
+          ARCH=aarch64
+          MIRROR="${ALPINE_MIRROR}/${ALPINE_BRANCH}/main"
+          echo "▶ 初始化 Alpine rootfs (${ALPINE_BRANCH}, ${ARCH}) ..."
+
+          sudo mkdir -p "${ROOTFS_DIR}"
+
+          # 使用 apk.static 引导 Alpine minimal rootfs
+          sudo apk.static \
+            -X "${MIRROR}" \
+            -U --allow-untrusted \
+            --root "${ROOTFS_DIR}" \
+            --arch "${ARCH}" \
+            --initdb \
+            add alpine-base
+
+          # 配置 APK 源
+          sudo mkdir -p "${ROOTFS_DIR}/etc/apk"
+          cat <<EOF | sudo tee "${ROOTFS_DIR}/etc/apk/repositories" > /dev/null
+          ${ALPINE_MIRROR}/${ALPINE_BRANCH}/main
+          ${ALPINE_MIRROR}/${ALPINE_BRANCH}/community
+          EOF
+
+          # 注册 QEMU binfmt（支持 aarch64 chroot 在 x86_64 runner 上运行）
+          sudo update-binfmts --enable qemu-aarch64 2>/dev/null || true
+          sudo cp /usr/bin/qemu-aarch64-static "${ROOTFS_DIR}/usr/bin/" 2>/dev/null || true
+
+          # ── 安装基础包 ────────────────────────────────────────────────
+          echo "▶ 安装基础软件包..."
+          sudo chroot "${ROOTFS_DIR}" /bin/sh -c "
+            set -e
+            apk update
+            apk add --no-cache \
+              openssh openrc \
+              sudo curl wget ca-certificates \
+              tzdata \
+              iproute2 \
+              net-tools iputils \
+              wireless-tools chrony bc \
+              bash \
+              htop nano nftables \
+              u-boot-tools parted \
+              btrfs-progs e2fsprogs dosfstools \
+              lsof file procps \
+              rsync \
+              util-linux \
+              findmnt
+          "
+
+          # ── 额外包 ────────────────────────────────────────────────────
+          if [[ -n "${EXTRA_PKGS}" ]]; then
+            echo "▶ 安装额外包: ${EXTRA_PKGS}"
+            sudo chroot "${ROOTFS_DIR}" /bin/sh -c "
+              apk add --no-cache ${EXTRA_PKGS}
+            "
+          fi
+
+          # ── 时区 ──────────────────────────────────────────────────────
+          sudo chroot "${ROOTFS_DIR}" /bin/sh -c "
+            cp /usr/share/zoneinfo/${TZ_VAL} /etc/localtime
+            echo '${TZ_VAL}' > /etc/timezone
+          "
+
+          # ── hostname ──────────────────────────────────────────────────
+          echo "${HOSTNAME_VAL}" | sudo tee "${ROOTFS_DIR}/etc/hostname" > /dev/null
+          printf '127.0.0.1\tlocalhost\n127.0.1.1\t%s\n::1\tlocalhost ip6-localhost ip6-loopback\n' \
+            "${HOSTNAME_VAL}" | sudo tee "${ROOTFS_DIR}/etc/hosts" > /dev/null
+
+          # ── SSH 配置 ──────────────────────────────────────────────────
+          sudo mkdir -p -m 0755 "${ROOTFS_DIR}/var/run/sshd"
+          cat <<'SSHCFG' | sudo tee "${ROOTFS_DIR}/etc/ssh/sshd_config" > /dev/null
+          Port 22
+          PermitRootLogin yes
+          PasswordAuthentication yes
+          PubkeyAuthentication yes
+          PrintMotd no
+          Subsystem sftp /usr/lib/ssh/sftp-server
+          SSHCFG
+
+          # ── root 密码 ─────────────────────────────────────────────────
+          ROOT_HASH="$(openssl passwd -6 "${ROOT_PASSWORD}")"
+          sudo sed -i "s|^root:[^:]*|root:${ROOT_HASH}|" "${ROOTFS_DIR}/etc/shadow"
+
+          # ── 网络（使用 Alpine 默认 networking + udhcpc）──────────────
+          cat <<'NETCFG' | sudo tee "${ROOTFS_DIR}/etc/network/interfaces" > /dev/null
+          auto lo
+          iface lo inet loopback
+
+          auto eth0
+          iface eth0 inet dhcp
+          NETCFG
+
+          # ── fstab ─────────────────────────────────────────────────────
+          printf 'LABEL=ROOTFS\t/\text4\tdefaults,noatime,nodiratime,commit=600,errors=remount-ro\t0 1\n' \
+            | sudo tee    "${ROOTFS_DIR}/etc/fstab" > /dev/null
+          printf 'LABEL=BOOT\t/boot\tvfat\tdefaults\t0 2\n' \
+            | sudo tee -a "${ROOTFS_DIR}/etc/fstab" > /dev/null
+
+          # ── /etc/os-release（rebuild 脚本需要 ID 和 VERSION_CODENAME）──
+          # rebuild 从 os-release 读取 ID 和 VERSION_CODENAME 来命名镜像文件
+          ALPINE_VER_NODOT="${ALPINE_VERSION//.}"
+          cat <<EOF | sudo tee "${ROOTFS_DIR}/etc/os-release" > /dev/null
+          NAME="Alpine Linux"
+          ID=alpine
+          VERSION_ID=${ALPINE_VERSION}
+          VERSION_CODENAME=alpine${ALPINE_VER_NODOT}
+          PRETTY_NAME="Alpine Linux ${ALPINE_VERSION}"
+          HOME_URL="https://alpinelinux.org/"
+          BUG_REPORT_URL="https://gitlab.alpinelinux.org/alpine/aports/-/issues"
+          EOF
+
+          # ── 注入平台脚本 ──────────────────────────────────────────────
+          sudo mkdir -p "${ROOTFS_DIR}/usr/lib/alpine"
+          sudo mkdir -p "${ROOTFS_DIR}/etc/default"
+          sudo mkdir -p "${ROOTFS_DIR}/etc/init.d"
+          sudo mkdir -p "${ROOTFS_DIR}/usr/local/bin"
+          sudo mkdir -p "${ROOTFS_DIR}/etc/custom_service"
+          sudo mkdir -p "${ROOTFS_DIR}/etc/modules-load.d"
+          sudo mkdir -p "${ROOTFS_DIR}/etc/modprobe.d"
+
+          for f in alpine/alpine-firstrun \
+                   alpine/alpine-common \
+                   alpine/alpine-hardware-optimization \
+                   alpine/alpine-resize-filesystem \
+                   alpine/alpine-ramlog \
+                   alpine/alpine-zram-config; do
+            sudo cp "${f}" "${ROOTFS_DIR}/usr/lib/alpine/$(basename ${f})"
+          done
+          sudo chmod +x "${ROOTFS_DIR}/usr/lib/alpine/"*
+
+          sudo cp alpine/alpine-release         "${ROOTFS_DIR}/etc/alpine-release"
+          sudo cp alpine/alpine-firstrun-etc    "${ROOTFS_DIR}/etc/default/alpine-firstrun"
+          sudo cp alpine/alpine-ramlog-etc      "${ROOTFS_DIR}/etc/default/alpine-ramlog"
+          sudo cp alpine/alpine-zram-config-etc "${ROOTFS_DIR}/etc/default/alpine-zram-config"
+          sudo cp alpine/alpine-update          "${ROOTFS_DIR}/usr/local/bin/alpine-update"
+          sudo chmod +x "${ROOTFS_DIR}/usr/local/bin/alpine-update"
+
+          # rc.local（OpenRC local 服务入口）
+          sudo cp alpine/alpine-rc.local "${ROOTFS_DIR}/etc/rc.local"
+          sudo chmod +x "${ROOTFS_DIR}/etc/rc.local"
+
+          # start_service.sh（从 rebuild common-files 注入）
+          sudo cp rebuild/build-armbian/armbian-files/common-files/etc/custom_service/start_service.sh \
+            "${ROOTFS_DIR}/etc/custom_service/start_service.sh"
+          sudo chmod +x "${ROOTFS_DIR}/etc/custom_service/start_service.sh"
+
+          # 内核模块自动加载列表
+          sudo cp rebuild/build-armbian/armbian-files/common-files/etc/modules-load.d/ophub-load-list.conf \
+            "${ROOTFS_DIR}/etc/modules-load.d/ophub-load-list.conf"
+          # Alpine 使用 /etc/modules（modules-load.d 由 kmod 处理，需安装 kmod）
+          sudo chroot "${ROOTFS_DIR}" /bin/sh -c "apk add --no-cache kmod" || true
+
+          # brcmfmac Wi-Fi 配置
+          sudo cp rebuild/build-armbian/armbian-files/common-files/etc/modprobe.d/brcmfmac.conf \
+            "${ROOTFS_DIR}/etc/modprobe.d/brcmfmac.conf"
+
+          # cpufreq 配置
+          sudo mkdir -p "${ROOTFS_DIR}/etc/default"
+          sudo cp rebuild/build-armbian/armbian-files/common-files/etc/default/cpufrequtils \
+            "${ROOTFS_DIR}/etc/default/cpufrequtils"
+
+          # sysctl 配置
+          sudo cp rebuild/build-armbian/armbian-files/common-files/etc/sysctl.conf \
+            "${ROOTFS_DIR}/etc/sysctl.conf"
+
+          # balance_irq 配置
+          sudo cp rebuild/build-armbian/armbian-files/common-files/etc/balance_irq \
+            "${ROOTFS_DIR}/etc/balance_irq"
+
+          # 安装 OpenRC init 脚本
+          for f in openrc/alpine-firstrun \
+                   openrc/alpine-hardware-optimize \
+                   openrc/alpine-ramlog \
+                   openrc/alpine-zram-config \
+                   openrc/alpine-resize-filesystem \
+                   openrc/local; do
+            sudo cp "${f}" "${ROOTFS_DIR}/etc/init.d/$(basename ${f})"
+            sudo chmod +x "${ROOTFS_DIR}/etc/init.d/$(basename ${f})"
+          done
+
+          # ── enable 服务（OpenRC）─────────────────────────────────────
+          sudo chroot "${ROOTFS_DIR}" /bin/sh -c "
+            rc-update add sshd default
+            rc-update add networking default
+            rc-update add chrony default
+            rc-update add local default
+            rc-update add alpine-firstrun default
+            rc-update add alpine-ramlog default
+            rc-update add alpine-hardware-optimize default
+            rc-update add alpine-resize-filesystem default
+            rc-update add alpine-zram-config default
+          "
+
+          # ── sysctl 应用（Alpine 在 boot runlevel 通过 sysctl 服务）──
+          sudo chroot "${ROOTFS_DIR}" /bin/sh -c "
+            rc-update add sysctl boot 2>/dev/null || true
+          "
+
+          sudo mkdir -p "${ROOTFS_DIR}/usr/lib/modules"
+          # 清理 QEMU 静态二进制（目标机无需）
+          sudo rm -f "${ROOTFS_DIR}/usr/bin/qemu-aarch64-static"
+
+          echo "▶ rootfs 完成: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
+          echo "status=success" >> "${GITHUB_OUTPUT}"
+
+      # ── 3B. 打包 rootfs tar.gz（仅自建模式）─────────────────────────
+      - name: Package rootfs
+        id: package_rootfs
+        if: ${{ env.BUILD_ROOTFS == 'true' && steps.build_rootfs.outputs.status == 'success' && !cancelled() }}
+        run: |
+          set -euo pipefail
+          OUT_DIR="${GITHUB_WORKSPACE}/output"
+          mkdir -p "${OUT_DIR}"
+
+          TARBALL="Alpine_${ALPINE_VERSION}_rootfs.tar.gz"
+          echo "▶ 打包 → ${TARBALL} ..."
+          sudo tar -czf "${OUT_DIR}/${TARBALL}" -C "${ROOTFS_DIR}" .
+          echo "▶ 大小: $(du -sh ${OUT_DIR}/${TARBALL} | awk '{print $1}')"
+
+          cd "${OUT_DIR}"
+          sha256sum "${TARBALL}" > "${TARBALL}.sha256"
+
+          BUILT_DATE="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          echo "TARBALL=${TARBALL}"       >> "${GITHUB_OUTPUT}"
+          echo "OUT_DIR=${OUT_DIR}"       >> "${GITHUB_OUTPUT}"
+          echo "BUILT_DATE=${BUILT_DATE}" >> "${GITHUB_OUTPUT}"
+          echo "status=success"           >> "${GITHUB_OUTPUT}"
+
+      # ── 3C. 下载已有 rootfs（填写 rootfs_url 时执行）────────────────
+      - name: Download existing rootfs
+        id: download_rootfs
+        if: ${{ env.BUILD_ROOTFS == 'false' && steps.init.outputs.status == 'success' && !cancelled() }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "${ROOTFS_DIR}"
+          echo "▶ 下载 rootfs: ${ROOTFS_URL}"
+          wget -q --show-progress -O /tmp/rootfs.tar.gz "${ROOTFS_URL}"
+          echo "▶ 解压..."
+          sudo tar -xf /tmp/rootfs.tar.gz -C "${ROOTFS_DIR}"
+          rm -f /tmp/rootfs.tar.gz
+          [[ -d "${ROOTFS_DIR}/etc" ]] || { echo "::error::rootfs 结构非法"; exit 1; }
+          echo "▶ 解压完成: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
+          echo "status=success" >> "${GITHUB_OUTPUT}"
+
+      # ── 4. 将 rootfs 打包成 Armbian 格式 img ─────────────────────────
+      - name: Pack rootfs into Armbian-format image
+        id: pack
+        if: >-
+          ${{
+            !cancelled() && (
+              (env.BUILD_ROOTFS == 'true'  && steps.build_rootfs.outputs.status == 'success') ||
+              (env.BUILD_ROOTFS == 'false' && steps.download_rootfs.outputs.status == 'success')
+            )
+          }}
+        run: |
+          set -euo pipefail
+
+          REBUILD_DIR="${GITHUB_WORKSPACE}/rebuild"
+          IMG_DIR="${REBUILD_DIR}/build/output/images"
+          mkdir -p "${IMG_DIR}"
+
+          IMG_NAME="Armbian_22.02.0-trunk_Alpine_${ALPINE_VERSION}_arm64.img"
+          IMG_PATH="${IMG_DIR}/${IMG_NAME}"
+
+          ROOTFS_MB=$(sudo du -sm "${ROOTFS_DIR}" | awk '{print $1}')
+          IMG_MB=$((ROOTFS_MB + 512 + 256))
+          echo "▶ rootfs=${ROOTFS_MB}MiB → 镜像=${IMG_MB}MiB"
+          sudo fallocate -l "${IMG_MB}M" "${IMG_PATH}"
+
+          sudo parted -s "${IMG_PATH}" mklabel msdos
+          sudo parted -s "${IMG_PATH}" mkpart primary ext4 4MiB 100%
+
+          LOOP=$(sudo losetup -P -f --show "${IMG_PATH}")
+          echo "▶ loop device: ${LOOP}"
+
+          sudo mkfs.ext4 -F -q -L "ROOTFS" -b 4096 "${LOOP}p1"
+
+          MNT=$(mktemp -d)
+          sudo mount "${LOOP}p1" "${MNT}"
+          echo "▶ 正在写入 rootfs..."
+          sudo rsync -a "${ROOTFS_DIR}/" "${MNT}/"
+          sudo sync
+          sudo umount "${MNT}"
+          sudo losetup -d "${LOOP}"
+          rmdir "${MNT}"
+
+          echo "▶ 镜像写入完成: $(du -sh ${IMG_PATH})"
+          echo "img_path=${IMG_PATH}"  >> "${GITHUB_OUTPUT}"
+          echo "img_outdir=${IMG_DIR}" >> "${GITHUB_OUTPUT}"
+          echo "status=success"        >> "${GITHUB_OUTPUT}"
+
+      # ── 5. Rebuild：注入内核 + uboot + 平台文件 ──────────────────────
+      - name: Rebuild image
+        id: rebuild
+        if: ${{ steps.pack.outputs.status == 'success' && !cancelled() }}
+        env:
+          KERNEL: ${{ inputs.armbian_kernel }}
+          FSTYPE: ${{ inputs.armbian_fstype }}
+          BUILDER: ${{ inputs.builder_name }}
+        run: |
+          set -euo pipefail
+          REBUILD_DIR="${GITHUB_WORKSPACE}/rebuild"
+          sudo chmod +x "${REBUILD_DIR}/rebuild"
+          cd "${REBUILD_DIR}"
+
+          echo "▶ 执行: sudo ./rebuild -b ${BOARD} -k ${KERNEL} -a true -t ${FSTYPE} -s 256/1024 -r ophub/kernel -n ${BUILDER}"
+          sudo ./rebuild \
+            -b ${BOARD} \
+            -k ${KERNEL} \
+            -a true \
+            -t ${FSTYPE} \
+            -s 256/1024 \
+            -r ophub/kernel \
+            -n ${BUILDER}
+
+          OUTPUT_DIR="${REBUILD_DIR}/build/output/images"
+          ls -lh "${OUTPUT_DIR}/"
+
+          PACKAGED_FILE="$(ls ${OUTPUT_DIR}/*.img.gz 2>/dev/null | head -1)"
+          [[ -z "${PACKAGED_FILE}" ]] && { echo "::error::rebuild 未生成 .img.gz"; exit 1; }
+
+          echo "PACKAGED_OUTPUTPATH=${OUTPUT_DIR}" >> "${GITHUB_ENV}"
+          echo "PACKAGED_STATUS=success"           >> "${GITHUB_ENV}"
+
+      # ── 6A. 发布固件 + rootfs（自建模式）────────────────────────────
+      - name: Release firmware + rootfs
+        uses: ncipollo/release-action@main
+        if: ${{ env.PACKAGED_STATUS == 'success' && env.BUILD_ROOTFS == 'true' && !cancelled() }}
+        with:
+          tag: "Alpine_${{ inputs.alpine_version }}_${{ inputs.armbian_kernel }}_${{ github.run_number }}"
+          name: "Alpine ${{ inputs.alpine_version }} · panther-x2 · ${{ inputs.armbian_kernel }}"
+          artifacts: |
+            ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz*
+            ${{ steps.package_rootfs.outputs.OUT_DIR }}/${{ steps.package_rootfs.outputs.TARBALL }}
+            ${{ steps.package_rootfs.outputs.OUT_DIR }}/${{ steps.package_rootfs.outputs.TARBALL }}.sha256
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## Alpine Linux ${{ inputs.alpine_version }} for panther-x2 (RK3566)
+
+            | 参数 | 值 |
+            |------|-----|
+            | Alpine 版本 | `${{ inputs.alpine_version }}` |
+            | 内核 | `${{ inputs.armbian_kernel }}` |
+            | 文件系统 | `${{ inputs.armbian_fstype }}` |
+            | 时区 | `${{ env.TZ_VAL }}` |
+            | 构建时间 | `${{ steps.package_rootfs.outputs.BUILT_DATE }}` |
+            | 构建编号 | `#${{ github.run_number }}` |
+
+            ## 附件说明
+            - `*.img.gz` — 可直接烧录的固件
+            - `Alpine_*_rootfs.tar.gz` — rootfs 归档，下次构建可填入 rootfs_url 跳过初始化
+
+            ## 复用此 rootfs
+            下次触发时在 **rootfs_url** 填入：
+            ```
+            https://github.com/${{ github.repository }}/releases/download/Alpine_${{ inputs.alpine_version }}_${{ inputs.armbian_kernel }}_${{ github.run_number }}/Alpine_${{ inputs.alpine_version }}_rootfs.tar.gz
+            ```
+
+      # ── 6B. 仅发布固件（使用已有 rootfs 模式）───────────────────────
+      - name: Release firmware only
+        uses: ncipollo/release-action@main
+        if: ${{ env.PACKAGED_STATUS == 'success' && env.BUILD_ROOTFS == 'false' && !cancelled() }}
+        with:
+          tag: "Alpine_${{ inputs.alpine_version }}_${{ inputs.armbian_kernel }}_${{ github.run_number }}"
+          name: "Alpine ${{ inputs.alpine_version }} · panther-x2 · ${{ inputs.armbian_kernel }}"
+          artifacts: "${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz*"
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## Alpine Linux ${{ inputs.alpine_version }} for panther-x2 (RK3566)
+
+            | 参数 | 值 |
+            |------|-----|
+            | 来源 rootfs | `${{ inputs.rootfs_url }}` |
+            | 内核 | `${{ inputs.armbian_kernel }}` |
+            | 文件系统 | `${{ inputs.armbian_fstype }}` |
+            | 构建编号 | `#${{ github.run_number }}` |
