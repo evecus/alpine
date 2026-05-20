@@ -484,7 +484,7 @@ jobs:
             -k ${KERNEL} \
             -a true \
             -t ${FSTYPE} \
-            -s 256/1024 \
+            -s 256/256 \
             -r ophub/kernel \
             -n ${BUILDER}
 
