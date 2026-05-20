@@ -102,6 +102,7 @@ jobs:
           sudo -E apt-get -y purge \
             azure-cli ghc* zulu* llvm* firefox google* dotnet* \
             powershell openjdk* mongodb* moby* 2>/dev/null || true
+          # apk-tools-static 不在 Ubuntu apt 源中，单独下载
           sudo -E apt-get -y install \
             parted e2fsprogs dosfstools btrfs-progs \
             u-boot-tools uuid-runtime openssl pigz \
@@ -110,41 +111,52 @@ jobs:
           sudo -E apt-get clean
           sudo -E timedatectl set-timezone "${TZ}"
 
-          # ── 下载 apk.static（Alpine 官方静态二进制，Ubuntu apt 源中没有）
+          # ── 下载 apk.static（Alpine 官方静态二进制）─────────────────
+          # Ubuntu apt 源不提供 apk-tools-static，从 Alpine CDN 直接获取
           APK_TOOLS_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64"
           APK_TOOLS_PKG=$(curl -fsSL "${APK_TOOLS_URL}/" | grep -oE 'apk-tools-static-[0-9][^"]+\.apk' | tail -1)
           echo "▶ 下载 apk-tools-static: ${APK_TOOLS_PKG}"
           curl -fsSL "${APK_TOOLS_URL}/${APK_TOOLS_PKG}" -o /tmp/apk-tools-static.apk
           mkdir -p /tmp/apk-tools-extract
           tar -xzf /tmp/apk-tools-static.apk -C /tmp/apk-tools-extract 2>/dev/null || true
-          APK_BIN=$(find /tmp/apk-tools-extract -name "apk.static" 2>/dev/null | head -1)
-          [[ -n "${APK_BIN}" ]] || { echo "::error::无法提取 apk.static"; exit 1; }
-          sudo install -m 755 "${APK_BIN}" /usr/local/bin/apk.static
+          if [[ -f /tmp/apk-tools-extract/sbin/apk.static ]]; then
+            sudo install -m 755 /tmp/apk-tools-extract/sbin/apk.static /usr/local/bin/apk.static
+          else
+            # .apk 实际是 tar.gz，尝试不同路径
+            APK_BIN=$(find /tmp/apk-tools-extract -name "apk.static" 2>/dev/null | head -1)
+            if [[ -n "${APK_BIN}" ]]; then
+              sudo install -m 755 "${APK_BIN}" /usr/local/bin/apk.static
+            else
+              echo "::error::无法提取 apk.static" && exit 1
+            fi
+          fi
           apk.static --version
           rm -rf /tmp/apk-tools-static.apk /tmp/apk-tools-extract
 
           # 写入运行时变量
           ALPINE_VER="${{ inputs.alpine_version || '3.21' }}"
+          # edge 分支直接用 edge，否则拼 v 前缀
           if [[ "${ALPINE_VER}" == "edge" ]]; then
             ALPINE_BRANCH="edge"
           else
             ALPINE_BRANCH="v${ALPINE_VER}"
           fi
-          echo "ALPINE_VERSION=${ALPINE_VER}"                                  >> "${GITHUB_ENV}"
-          echo "ALPINE_BRANCH=${ALPINE_BRANCH}"                                >> "${GITHUB_ENV}"
-          echo "ROOT_PASSWORD=${{ inputs.root_password || '1234' }}"           >> "${GITHUB_ENV}"
-          echo "HOSTNAME_VAL=${{ inputs.hostname || 'alpine' }}"               >> "${GITHUB_ENV}"
-          echo "TZ_VAL=${{ inputs.timezone || 'Asia/Shanghai' }}"              >> "${GITHUB_ENV}"
-          echo "EXTRA_PKGS=${{ inputs.extra_packages || '' }}"                 >> "${GITHUB_ENV}"
+          echo "ALPINE_VERSION=${ALPINE_VER}"     >> "${GITHUB_ENV}"
+          echo "ALPINE_BRANCH=${ALPINE_BRANCH}"   >> "${GITHUB_ENV}"
+          echo "ROOT_PASSWORD=${{ inputs.root_password || '1234' }}"         >> "${GITHUB_ENV}"
+          echo "HOSTNAME_VAL=${{ inputs.hostname || 'alpine' }}"             >> "${GITHUB_ENV}"
+          echo "TZ_VAL=${{ inputs.timezone || 'Asia/Shanghai' }}"            >> "${GITHUB_ENV}"
+          echo "EXTRA_PKGS=${{ inputs.extra_packages || '' }}"               >> "${GITHUB_ENV}"
 
+          # 判断模式
           ROOTFS_URL="${{ inputs.rootfs_url }}"
           if [[ -n "${ROOTFS_URL}" ]]; then
-            echo "BUILD_ROOTFS=false"          >> "${GITHUB_ENV}"
-            echo "ROOTFS_URL=${ROOTFS_URL}"    >> "${GITHUB_ENV}"
+            echo "BUILD_ROOTFS=false" >> "${GITHUB_ENV}"
+            echo "ROOTFS_URL=${ROOTFS_URL}" >> "${GITHUB_ENV}"
             echo "▶ 模式：使用已有 rootfs → ${ROOTFS_URL}"
           else
-            echo "BUILD_ROOTFS=true"           >> "${GITHUB_ENV}"
-            echo "ROOTFS_URL="                 >> "${GITHUB_ENV}"
+            echo "BUILD_ROOTFS=true"  >> "${GITHUB_ENV}"
+            echo "ROOTFS_URL="        >> "${GITHUB_ENV}"
             echo "▶ 模式：自建 rootfs"
           fi
 
@@ -180,14 +192,15 @@ jobs:
           echo "▶ 初始化 Alpine rootfs (${ALPINE_BRANCH}, ${ARCH}) ..."
           sudo mkdir -p "${ROOTFS_DIR}"
 
-          # ── 配置 APK 源（提前写入，apk.static --root 需要）──────────
+          # ── APK 源配置（提前写入，apk.static 需要） ──────────────────
           sudo mkdir -p "${ROOTFS_DIR}/etc/apk"
           printf '%s\n%s\n' \
             "${ALPINE_MIRROR}/${ALPINE_BRANCH}/main" \
             "${ALPINE_MIRROR}/${ALPINE_BRANCH}/community" \
             | sudo tee "${ROOTFS_DIR}/etc/apk/repositories" > /dev/null
 
-          # 所有包安装通过 apk.static --root 完成，宿主机网络，无需 chroot
+          # ── 定义 apk 辅助函数（宿主机直接操作，无需 chroot）─────────
+          # 所有包安装通过 apk.static --root 完成，避免 chroot 内网络问题
           APK="sudo apk.static --root ${ROOTFS_DIR} --arch ${ARCH} --allow-untrusted"
 
           # ── Step 1：引导最小 rootfs ───────────────────────────────────
@@ -200,7 +213,7 @@ jobs:
             --initdb \
             add alpine-base
 
-          # ── Step 2：安装基础包 ────────────────────────────────────────
+          # ── Step 2：安装基础包（宿主机网络，--root 操作目标 rootfs）─
           echo "▶ 安装基础软件包..."
           ${APK} add --no-cache \
             openssh openrc \
@@ -224,7 +237,7 @@ jobs:
             ${APK} add --no-cache ${EXTRA_PKGS}
           fi
 
-          # ── Step 4：时区 ──────────────────────────────────────────────
+          # ── Step 4：时区（直接复制文件，不需要 chroot）──────────────
           TZ_FILE="${ROOTFS_DIR}/usr/share/zoneinfo/${TZ_VAL}"
           if [[ -f "${TZ_FILE}" ]]; then
             sudo cp "${TZ_FILE}" "${ROOTFS_DIR}/etc/localtime"
@@ -240,8 +253,7 @@ jobs:
 
           # ── Step 6：SSH 配置 ──────────────────────────────────────────
           sudo mkdir -p -m 0755 "${ROOTFS_DIR}/etc/ssh" "${ROOTFS_DIR}/var/run/sshd"
-          # heredoc 结束符必须顶格，不能有前置空格
-          cat > /tmp/sshd_config << 'EOF'
+          cat > /tmp/sshd_config << 'SSHEOF'
           Port 22
           PermitRootLogin yes
           PasswordAuthentication yes
@@ -249,29 +261,30 @@ jobs:
           UsePAM no
           PrintMotd no
           Subsystem sftp /usr/lib/ssh/sftp-server
-          EOF
+          SSHEOF
           sudo cp /tmp/sshd_config "${ROOTFS_DIR}/etc/ssh/sshd_config"
 
-          # ── Step 7：root 密码 ─────────────────────────────────────────
+          # ── Step 7：root 密码（直接写 shadow，不需要 chroot passwd）─
           ROOT_HASH="$(openssl passwd -6 "${ROOT_PASSWORD}")"
           if sudo grep -q "^root:" "${ROOTFS_DIR}/etc/shadow" 2>/dev/null; then
             sudo sed -i "s|^root:[^:]*|root:${ROOT_HASH}|" "${ROOTFS_DIR}/etc/shadow"
           else
-            printf 'root:%s:0:0:99999:7:::\n' "${ROOT_HASH}" | sudo tee -a "${ROOTFS_DIR}/etc/shadow" > /dev/null
+            echo "root:${ROOT_HASH}:0:0:99999:7:::" | sudo tee -a "${ROOTFS_DIR}/etc/shadow" > /dev/null
           fi
+          # 确保 passwd 里 root shell 正确
           if ! sudo grep -q "^root:" "${ROOTFS_DIR}/etc/passwd" 2>/dev/null; then
             echo "root:x:0:0:root:/root:/bin/sh" | sudo tee -a "${ROOTFS_DIR}/etc/passwd" > /dev/null
           fi
 
           # ── Step 8：网络配置 ──────────────────────────────────────────
           sudo mkdir -p "${ROOTFS_DIR}/etc/network"
-          cat > /tmp/interfaces << 'EOF'
+          cat > /tmp/interfaces << 'NETEOF'
           auto lo
           iface lo inet loopback
 
           auto eth0
           iface eth0 inet dhcp
-          EOF
+          NETEOF
           sudo cp /tmp/interfaces "${ROOTFS_DIR}/etc/network/interfaces"
 
           # ── Step 9：fstab ─────────────────────────────────────────────
@@ -282,27 +295,26 @@ jobs:
 
           # ── Step 10：os-release（rebuild 脚本需要 ID + VERSION_CODENAME）
           ALPINE_VER_NODOT="${ALPINE_VERSION//.}"
-          # 用 printf 逐行写入，避免 heredoc 变量展开歧义
-          {
-            printf 'NAME="Alpine Linux"\n'
-            printf 'ID=alpine\n'
-            printf 'VERSION_ID=%s\n'          "${ALPINE_VERSION}"
-            printf 'VERSION_CODENAME=%s\n'    "alpine${ALPINE_VER_NODOT}"
-            printf 'PRETTY_NAME="Alpine Linux %s"\n' "${ALPINE_VERSION}"
-            printf 'HOME_URL="https://alpinelinux.org/"\n'
-            printf 'BUG_REPORT_URL="https://gitlab.alpinelinux.org/alpine/aports/-/issues"\n'
-          } | sudo tee "${ROOTFS_DIR}/etc/os-release" > /dev/null
+          cat > /tmp/os-release << OSEOF
+          NAME="Alpine Linux"
+          ID=alpine
+          VERSION_ID=${ALPINE_VERSION}
+          VERSION_CODENAME=alpine${ALPINE_VER_NODOT}
+          PRETTY_NAME="Alpine Linux ${ALPINE_VERSION}"
+          HOME_URL="https://alpinelinux.org/"
+          BUG_REPORT_URL="https://gitlab.alpinelinux.org/alpine/aports/-/issues"
+          OSEOF
+          sudo cp /tmp/os-release "${ROOTFS_DIR}/etc/os-release"
 
           # ── Step 11：注入平台脚本 ─────────────────────────────────────
-          sudo mkdir -p \
-            "${ROOTFS_DIR}/usr/lib/alpine" \
-            "${ROOTFS_DIR}/etc/default" \
-            "${ROOTFS_DIR}/etc/init.d" \
-            "${ROOTFS_DIR}/usr/local/bin" \
-            "${ROOTFS_DIR}/etc/custom_service" \
-            "${ROOTFS_DIR}/etc/modules-load.d" \
-            "${ROOTFS_DIR}/etc/modprobe.d" \
-            "${ROOTFS_DIR}/root"
+          sudo mkdir -p "${ROOTFS_DIR}/usr/lib/alpine"
+          sudo mkdir -p "${ROOTFS_DIR}/etc/default"
+          sudo mkdir -p "${ROOTFS_DIR}/etc/init.d"
+          sudo mkdir -p "${ROOTFS_DIR}/usr/local/bin"
+          sudo mkdir -p "${ROOTFS_DIR}/etc/custom_service"
+          sudo mkdir -p "${ROOTFS_DIR}/etc/modules-load.d"
+          sudo mkdir -p "${ROOTFS_DIR}/etc/modprobe.d"
+          sudo mkdir -p "${ROOTFS_DIR}/root"
 
           for f in alpine/alpine-firstrun \
                    alpine/alpine-common \
@@ -349,32 +361,42 @@ jobs:
             sudo chmod +x "${ROOTFS_DIR}/etc/init.d/$(basename ${f})"
           done
 
-          # ── Step 12：OpenRC 服务注册（直接建软链，等价于 rc-update add）
+          # ── Step 12：OpenRC 服务注册（直接写 runlevel 软链）─────────
           sudo mkdir -p \
             "${ROOTFS_DIR}/etc/runlevels/sysinit" \
             "${ROOTFS_DIR}/etc/runlevels/boot" \
             "${ROOTFS_DIR}/etc/runlevels/default" \
             "${ROOTFS_DIR}/etc/runlevels/shutdown"
 
-          # boot runlevel：链接 Alpine 自带的基础服务（如果存在）
-          for svc in sysfs dmesg hwclock modules sysctl; do
+          # sysinit：内核/设备初始化
+          for svc in devfs dmesg mdev; do
+            [[ -f "${ROOTFS_DIR}/etc/init.d/${svc}" ]] && \
+              sudo ln -sf "/etc/init.d/${svc}" "${ROOTFS_DIR}/etc/runlevels/sysinit/${svc}" || true
+          done
+
+          # boot：挂载完成后执行
+          # - zram 需在 swap 前配置
+          # - ramlog 把 /var/log 挂到 tmpfs（必须在 syslog 启动前）
+          # - resize-filesystem 在此阶段扩容（rootfs 已 rw，比 default 早）
+          # - networking 在 boot 确保 sshd 启动时网络已就绪
+          for svc in sysctl modules hwclock; do
             [[ -f "${ROOTFS_DIR}/etc/init.d/${svc}" ]] && \
               sudo ln -sf "/etc/init.d/${svc}" "${ROOTFS_DIR}/etc/runlevels/boot/${svc}" || true
           done
+          for svc in alpine-zram-config alpine-ramlog alpine-resize-filesystem networking; do
+            sudo ln -sf "/etc/init.d/${svc}" "${ROOTFS_DIR}/etc/runlevels/boot/${svc}"
+          done
 
-          # default runlevel
-          for svc in sshd networking chrony local \
-                     alpine-firstrun alpine-ramlog \
-                     alpine-hardware-optimize \
-                     alpine-resize-filesystem \
-                     alpine-zram-config; do
+          # default：正常用户态服务
+          for svc in sshd chrony local alpine-firstrun alpine-hardware-optimize; do
             sudo ln -sf "/etc/init.d/${svc}" "${ROOTFS_DIR}/etc/runlevels/default/${svc}"
           done
 
-          # shutdown：ramlog 需要在关机时同步到磁盘
+          # shutdown：ramlog 关机时同步日志到磁盘
           sudo ln -sf /etc/init.d/alpine-ramlog "${ROOTFS_DIR}/etc/runlevels/shutdown/alpine-ramlog"
 
           sudo mkdir -p "${ROOTFS_DIR}/usr/lib/modules"
+
           echo "▶ rootfs 完成: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
