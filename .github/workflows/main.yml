@@ -102,7 +102,7 @@ jobs:
           sudo -E apt-get -y purge \
             azure-cli ghc* zulu* llvm* firefox google* dotnet* \
             powershell openjdk* mongodb* moby* 2>/dev/null || true
-          # alpine-base 构建依赖：用 alpine-chroot-install 或 apk-tools-static
+          # apk-tools-static 不在 Ubuntu apt 源中，单独下载
           sudo -E apt-get -y install \
             parted e2fsprogs dosfstools btrfs-progs \
             u-boot-tools uuid-runtime openssl pigz \
@@ -110,15 +110,28 @@ jobs:
           sudo -E apt-get -y autoremove --purge
           sudo -E apt-get clean
           sudo -E timedatectl set-timezone "${TZ}"
-          wget https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/apk-tools-static-2.14.6-r3.apk
 
-          # 3. 提取里面的 sbin/apk.static 文件到系统的 /usr/bin/ 目录下
-          tar -xf apk-tools-static-2.14.6-r3.apk --strip-components=1 sbin/apk.static
-          sudo mv apk.static /usr/bin/apk.static
-          sudo chmod +x /usr/bin/apk.static
-
-          # 4. 清理下载的临时文件
-          rm -f apk-tools-static-2.14.6-r3.apk
+          # ── 下载 apk.static（Alpine 官方静态二进制）─────────────────
+          # Ubuntu apt 源不提供 apk-tools-static，从 Alpine CDN 直接获取
+          APK_TOOLS_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64"
+          APK_TOOLS_PKG=$(curl -fsSL "${APK_TOOLS_URL}/" | grep -oE 'apk-tools-static-[0-9][^"]+\.apk' | tail -1)
+          echo "▶ 下载 apk-tools-static: ${APK_TOOLS_PKG}"
+          curl -fsSL "${APK_TOOLS_URL}/${APK_TOOLS_PKG}" -o /tmp/apk-tools-static.apk
+          mkdir -p /tmp/apk-tools-extract
+          tar -xzf /tmp/apk-tools-static.apk -C /tmp/apk-tools-extract 2>/dev/null || true
+          if [[ -f /tmp/apk-tools-extract/sbin/apk.static ]]; then
+            sudo install -m 755 /tmp/apk-tools-extract/sbin/apk.static /usr/local/bin/apk.static
+          else
+            # .apk 实际是 tar.gz，尝试不同路径
+            APK_BIN=$(find /tmp/apk-tools-extract -name "apk.static" 2>/dev/null | head -1)
+            if [[ -n "${APK_BIN}" ]]; then
+              sudo install -m 755 "${APK_BIN}" /usr/local/bin/apk.static
+            else
+              echo "::error::无法提取 apk.static" && exit 1
+            fi
+          fi
+          apk.static --version
+          rm -rf /tmp/apk-tools-static.apk /tmp/apk-tools-extract
 
           # 写入运行时变量
           ALPINE_VER="${{ inputs.alpine_version || '3.21' }}"
